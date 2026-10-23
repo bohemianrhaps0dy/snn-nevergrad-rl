@@ -62,11 +62,12 @@ for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
 
 
 # ===================== CONFIG: define the experiment here =====================
-ENVIRONMENTS = ['mountaincar', 'acrobot']
+ENVIRONMENTS = ['mountaincar']
 ENCODINGS    = ['poprate','poplatency']
-TOPOLOGIES   = [[10]]          # genome scales with input width too
-OPTIMIZERS   = ['TBPSA'] # any subset optimize_snn understands
-TRIALS       = 1                                # repeats per cell (different trial seed)
+TOPOLOGIES   = [[6]]          # genome scales with input width too
+N_PER_DIM    = [10] # neurons per observation dim, swept for the population
+OPTIMIZERS   = ['TwoPointsDE','RandomSearch','NoisyRL3'] # any subset optimize_snn understands
+TRIALS       = 5                                # repeats per cell (different trial seed)
 WORKERS      = 0                                # parallel worker processes; 0 = auto
                                                 # (os.cpu_count()), 1 = serial
 
@@ -84,22 +85,9 @@ DECODERS_ALL  = ('vote', 'first')
 # sample budgets. Use 'fixed' for the headline "families at a fixed budget"
 # result; use 'per_dim' to ask "best each encoding can do, budget-fair".
 BUDGET_MODE   = 'fixed'                          # 'fixed' | 'per_dim'
-BUDGET        = 5000
+BUDGET        = 2000
 EVALS_PER_DIM = 1
 BUDGET_MIN, BUDGET_MAX = 200, 4000
-
-# ---- OPTIONAL meta-optimization phase (runs only with --meta / --meta-only) ----
-META_FAMILIES     = ['cma']                     # inner families to tune: cma|de|pso
-META_OUTER_BUDGET = 50
-META_K            = 15
-META_INNER_BUDGET = 200
-# representative config to TUNE ON, per environment (overrides meta_optimize's own
-# REPRESENTATIVE). Pick a config the diagnostics call sound -- tuning an optimizer
-# against an unsolvable config makes "improvement over default" meaningless.
-META_CONFIGS = {
-    'mountaincar': dict(hidden_sizes=[8], encoding='poprate', decoding='vote'),
-    'acrobot':     dict(hidden_sizes=[8], encoding='latency', decoding='first'),
-}
 
 # cost-estimate only (measure your own machine); does not affect the actual run.
 EP_SECONDS      = {'mountaincar': 0.018, 'acrobot': 0.065}
@@ -121,6 +109,8 @@ def decoders_for(encoding):
         return ['first'] if encoding in ('latency', 'poplatency') else ['vote']
     return list(DECODERS_ALL)
 
+def n_str(n):
+    return '-' if n is None else str(n)
 
 def iter_cells():
     """Yield (env, hidden, encoding, decoding, trial) for the whole grid."""
@@ -128,29 +118,27 @@ def iter_cells():
         for hidden in TOPOLOGIES:
             for enc in ENCODINGS:
                 for dec in decoders_for(enc):
-                    for trial in range(TRIALS):
-                        yield env, hidden, enc, dec, trial
+                    for n in N_PER_DIM:
+                        for trial in range(TRIALS):
+                            yield env, hidden, enc, dec, n, trial
 
 
-def cell_key(env, hidden, enc, dec, trial):
-    return f"{env}|{topo_str(hidden)}|{enc}|{dec}|t{trial}"
+def cell_key(env, hidden, enc, dec, n, trial):
+    return f"{env}|{topo_str(hidden)}|{enc}|{dec}|n{n_str(n)}|t{trial}"
 
 
-def genome_dim(env, hidden, encoding):
+
+def genome_dim(env, hidden, encoding, n_per_dim=None):
     """Genome size for a cell, via the real weight_shapes/n_params. Falls back
     gracefully if a diverged weight_shapes lacks the `encoding` arg."""
     from snn_feedforward import weight_shapes
     from optimize_snn import n_params
-    try:
-        shapes = weight_shapes(env, hidden, encoding)
-    except TypeError:
-        shapes = weight_shapes(env, hidden)     # older signature
-    return int(n_params(shapes))
+    return int(n_params(weight_shapes(env, hidden, encoding, n_per_dim)))
 
 
-def budget_for(env, hidden, encoding):
+def budget_for(env, hidden, encoding, n_per_dim=None):
     if BUDGET_MODE == 'per_dim':
-        d = genome_dim(env, hidden, encoding)
+        d = genome_dim(env, hidden, encoding, n_per_dim)
         return int(min(BUDGET_MAX, max(BUDGET_MIN, EVALS_PER_DIM * d)))
     return BUDGET
 
@@ -176,7 +164,8 @@ def load_results(path):
 
 def _config_snapshot():
     return dict(environments=ENVIRONMENTS, encodings=ENCODINGS,
-                topologies=TOPOLOGIES, optimizers=OPTIMIZERS, trials=TRIALS,
+                topologies=TOPOLOGIES, n_per_dim=N_PER_DIM,
+                optimizers=OPTIMIZERS, trials=TRIALS,
                 decoding_mode=DECODING_MODE, budget_mode=BUDGET_MODE,
                 budget=BUDGET, evals_per_dim=EVALS_PER_DIM)
 
@@ -205,37 +194,35 @@ def _worker_init():
     os.environ['OMP_NUM_THREADS'] = '1'
     try:
         import ANNarchy as ann
-        ann.setup(num_threads=1)
+        ann.Network().setup(num_threads=1)
     except Exception:
         pass
 
-
-def _cell_genome(env, hidden, enc):
-    from snn_feedforward import weight_shapes
-    from optimize_snn import n_params
-    try:
-        shapes = weight_shapes(env, hidden, enc)
-    except TypeError:
-        shapes = weight_shapes(env, hidden)
-    return int(n_params(shapes))
+def _episode_list(values):
+    """Per-episode array -> plain list of floats for the JSON (None if absent)."""
+    return None if values is None else [float(v) for v in values]
 
 
 def _run_one_cell(task):
     """WORKER: build + optimize ONE cell (one network). Pure, picklable; returns
     (cell_key, record). Catches its own errors so one bad cell can't kill the pool."""
-    env, hidden, enc, dec, trial, budget, optimizers, save_weights, weights_dir = task
+    (env, hidden, enc, dec, n_per_dim, trial, budget, optimizers, save_weights,
+     weights_dir) = task
     t0 = time.time()
-    rec = dict(env=env, hidden=hidden, encoding=enc, decoding=dec, trial=trial,
-               budget=budget)
+    rec = dict(env=env, hidden=hidden, encoding=enc, decoding=dec,
+               n_per_dim=n_per_dim, trial=trial, budget=budget)
     try:
-        rec['genome_dim'] = _cell_genome(env, hidden, enc)
-        import optimize_snn as O
-        res = O.optimize(environment=env, hidden_sizes=hidden, encoding=enc,
+        rec['genome_dim'] = genome_dim(env, hidden, enc, n_per_dim)
+        from optimize_snn import optimize
+        res = optimize(environment=env, hidden_sizes=hidden, encoding=enc,
                          decoding=dec, optimizers=optimizers, budget=budget,
-                         trial=trial)
+                         trial=trial, n_per_dim=n_per_dim)
         rec['optimizers'] = {
             name: dict(fitness=r['fitness'], std=r['std'], sem=r['sem'],
-                       opt_loss=r.get('opt_loss'), n_episodes=r.get('n_episodes'))
+                       opt_loss=r.get('opt_loss'), n_episodes=r.get('n_episodes'),
+                       reward_mean=r.get('reward_mean'),
+                       rewards=_episode_list(r.get('rewards')),
+                       fitnesses=_episode_list(r.get('fitnesses')))
             for name, r in res.items()}
         best = max(res, key=lambda k: res[k]['fitness'])
         rec.update(status='ok', best_optimizer=best,
@@ -243,43 +230,15 @@ def _run_one_cell(task):
         if save_weights:                 # save per-cell (no big arrays through IPC)
             import pickle
             os.makedirs(weights_dir, exist_ok=True)
-            fn = cell_key(env, hidden, enc, dec, trial).replace('|', '__') + '.pkl'
+            fn = (cell_key(env, hidden, enc, dec, n_per_dim, trial)
+            .replace('|', '__') + '.pkl')
             with open(os.path.join(weights_dir, fn), 'wb') as f:
                 pickle.dump({n: r['weights'] for n, r in res.items()}, f)
     except Exception as e:
         rec.update(status='failed', error=f"{type(e).__name__}: {e}",
                    tb=traceback.format_exc())
     rec['seconds'] = round(time.time() - t0, 1)
-    return cell_key(env, hidden, enc, dec, trial), rec
-
-
-def _meta_key(t):
-    env, family, rep = t[0], t[1], t[2]
-    return (f"meta|{env}|{family}|{topo_str(rep['hidden_sizes'])}|"
-            f"{rep['encoding']}|{rep['decoding']}")
-
-
-def _run_one_meta(task):
-    """WORKER: one (env, family) meta-optimization. Sets the representative and
-    inner budget in ITS OWN process (module-global mutation is process-local, so
-    concurrent meta tasks with different configs don't clash)."""
-    env, family, rep, outer_budget, K, inner_budget = task
-    t0 = time.time()
-    entry = dict(env=env, family=family, representative=rep)
-    try:
-        import meta_optimize as M
-        M.INNER_BUDGET = inner_budget
-        M.REPRESENTATIVE[env] = rep
-        r = M.meta_optimize(env, family=family, outer_budget=outer_budget, K=K)
-        entry.update(best_theta=r['best_theta'],
-                     tuned=r['holdout_score'], tuned_std=r.get('holdout_std'),
-                     default=r['baseline_score'], default_std=r.get('baseline_std'),
-                     improvement=r['improvement'], status='ok')
-    except Exception as e:
-        entry.update(status='failed', error=f"{type(e).__name__}: {e}",
-                     tb=traceback.format_exc())
-    entry['seconds'] = round(time.time() - t0, 1)
-    return _meta_key(task), entry
+    return cell_key(env, hidden, enc, dec, n_per_dim, trial), rec
 
 
 def _print_cell(prefix, key, rec):
@@ -335,45 +294,26 @@ def _dispatch(tasks, worker_fn, key_of, store, results, path, workers, label):
 def run_grid(results, path, force, workers):
     cells = list(iter_cells())
     todo = []
-    for env, hidden, enc, dec, trial in cells:
-        prev = results['cells'].get(cell_key(env, hidden, enc, dec, trial))
+    for env, hidden, enc, dec, n, trial in cells:
+        prev = results['cells'].get(cell_key(env, hidden, enc, dec, n, trial))
         if prev and prev.get('status') == 'ok' and not force:
             continue
-        todo.append((env, hidden, enc, dec, trial))
+        todo.append((env, hidden, enc, dec, n, trial))
     print(f"[grid] {len(cells)} cells; {len(todo)} to run, "
           f"{len(cells) - len(todo)} already done; optimizers={OPTIMIZERS}")
     if not todo:
         return
     # longest-processing-time-first: heaviest cells start early so they don't
     # straggle at the tail under dynamic dispatch (better load balance).
-    todo.sort(key=lambda c: budget_for(c[0], c[1], c[2]) * EP_SECONDS.get(c[0], 0.03),
+    todo.sort(key=lambda c: (budget_for(c[0], c[1], c[2], c[4])
+                             * EP_SECONDS.get(c[0], 0.03)),
               reverse=True)
     weights_dir = os.path.splitext(path)[0] + '_weights'
-    tasks = [(env, hidden, enc, dec, trial, budget_for(env, hidden, enc),
+    tasks = [(env, hidden, enc, dec, n, trial, budget_for(env, hidden, enc, n),
               OPTIMIZERS, SAVE_WEIGHTS, weights_dir)
-             for (env, hidden, enc, dec, trial) in todo]
-    _dispatch(tasks, _run_one_cell, lambda t: cell_key(*t[:5]),
+             for (env, hidden, enc, dec, n, trial) in todo]
+    _dispatch(tasks, _run_one_cell, lambda t: cell_key(*t[:6]),
               results['cells'], results, path, workers, 'grid')
-
-
-# ---------------- the optional meta phase ----------------
-def run_meta(results, path, force, workers):
-    tasks = []
-    for env in [e for e in ENVIRONMENTS if e in META_CONFIGS]:
-        rep = META_CONFIGS[env]
-        for family in META_FAMILIES:
-            t = (env, family, rep, META_OUTER_BUDGET, META_K, META_INNER_BUDGET)
-            if _meta_key(t) in results['meta'] and not force:
-                continue
-            tasks.append(t)
-    print(f"\n[meta] {len(tasks)} (env,family) task(s) to run "
-          f"(outer={META_OUTER_BUDGET}, K={META_K}, inner={META_INNER_BUDGET})")
-    if not tasks:
-        return
-    # meta tasks are few and huge; never spawn more workers than tasks.
-    mw = min(workers, len(tasks)) if workers > 1 else workers
-    _dispatch(tasks, _run_one_meta, _meta_key,
-              results['meta'], results, path, mw, 'meta')
 
 
 # ---------------- dry run / cost estimate ----------------
@@ -381,18 +321,19 @@ def dry_run(workers):
     cells = list(iter_cells())
     print(f"=== DRY RUN ===  {len(cells)} cells, optimizers={OPTIMIZERS} "
           f"(budget_mode={BUDGET_MODE}, workers={workers})\n")
-    hdr = f"{'env':<12}{'topology':<10}{'encoding':<12}{'dec':<7}{'dim':>6}{'budget':>8}{'episodes':>10}"
+    hdr = (f"{'env':<12}{'topology':<10}{'encoding':<12}{'dec':<7}{'n/dim':>6}"
+           f"{'dim':>6}{'budget':>8}{'episodes':>10}")
     print(hdr); print('-' * len(hdr))
     total_ep = 0.0
     total_sec = 0.0
-    for env, hidden, enc, dec, trial in cells:
-        d = genome_dim(env, hidden, enc)
-        b = budget_for(env, hidden, enc)
+    for env, hidden, enc, dec, n, trial in cells:
+        d = genome_dim(env, hidden, enc, n)
+        b = budget_for(env, hidden, enc, n)
         ep = len(OPTIMIZERS) * (b + REPORT_EP_EST)
         total_ep += ep
         total_sec += ep * EP_SECONDS.get(env, 0.03) + COMPILE_SECONDS
         if trial == 0:                          # one line per cell (trials identical cost)
-            print(f"{env:<12}{topo_str(hidden):<10}{enc:<12}{dec:<7}"
+            print(f"{env:<12}{topo_str(hidden):<10}{enc:<12}{dec:<7}{n_str(n):>6}"
                   f"{d:>6}{b:>8}{ep:>10}")
     print('-' * len(hdr))
     par = total_sec / max(1, workers)
@@ -434,12 +375,13 @@ def summarize(results):
             rows = [v for v in ok.values() if v['env'] == env]
             rows.sort(key=lambda v: v['best_fitness'], reverse=True)
             print(f"\n-- {env} -- (ranked by best optimizer fitness)")
-            hd = (f"{'topology':<10}{'encoding':<12}{'dec':<7}{'best opt':<10}"
-                  f"{'fitness':>10}{'dim':>6}{'bud':>6}")
+            hd = (f"{'topology':<10}{'encoding':<12}{'dec':<7}{'n/dim':>5}  "
+                  f"{'best opt':<10}{'fitness':>10}{'dim':>6}{'bud':>6}")
             print(hd); print('-' * len(hd))
             for v in rows:
                 print(f"{topo_str(v['hidden']):<10}{v['encoding']:<12}"
-                      f"{v['decoding']:<7}{v.get('best_optimizer',''):<10}"
+                      f"{v['decoding']:<7}{n_str(v.get('n_per_dim')):>5}  "
+                      f"{v.get('best_optimizer',''):<10}"
                       f"{v['best_fitness']:>10.3f}{v['genome_dim']:>6}"
                       f"{v['budget']:>6}")
                 if (
@@ -451,7 +393,9 @@ def summarize(results):
                     wins[v.get('best_optimizer')] = wins.get(v.get('best_optimizer'), 0) + 1
             top = rows[0]
             print(f"   best {env} config: {top['encoding']}/{top['decoding']} "
-                  f"topo={topo_str(top['hidden'])} via {top.get('best_optimizer')} "
+                  f"topo={topo_str(top['hidden'])} "
+                  f"n_per_dim={n_str(top.get('n_per_dim'))} "
+                  f"via {top.get('best_optimizer')} "
                   f"-> {top['best_fitness']:.3f}")
         if wins:
             print("\noptimizer wins across cells: "
@@ -461,16 +405,6 @@ def summarize(results):
             print("\nfailed cells:")
             for k, v in fail.items():
                 print(f"  {k}: {v.get('error')}")
-
-    meta = results.get('meta', {})
-    if meta:
-        print("\n=== META-OPTIMIZATION ===")
-        for k, v in meta.items():
-            if v.get('status') == 'ok':
-                print(f"  {k}: tuned={v['tuned']:.3f} default={v['default']:.3f} "
-                      f"improvement={v['improvement']:+.3f}  theta={v['best_theta']}")
-            else:
-                print(f"  {k}: FAILED {v.get('error')}")
     print()
 
 
@@ -479,8 +413,6 @@ def main():
     ap = argparse.ArgumentParser(description="SNN study orchestrator")
     ap.add_argument('--dry-run', action='store_true',
                     help="list cells + cost estimate, run nothing")
-    ap.add_argument('--meta', action='store_true', help="also run the meta phase")
-    ap.add_argument('--meta-only', action='store_true', help="only the meta phase")
     ap.add_argument('--force', action='store_true',
                     help="ignore checkpoint; recompute every cell")
     ap.add_argument('--summarize', action='store_true',
@@ -502,11 +434,7 @@ def main():
     if args.summarize:
         summarize(results)
         return
-
-    if not args.meta_only:
-        run_grid(results, args.out, args.force, workers)
-    if args.meta or args.meta_only:
-        run_meta(results, args.out, args.force, workers)
+    run_grid(results, args.out, args.force, workers)
 
     summarize(results)
     print(f"results -> {args.out}")

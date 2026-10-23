@@ -7,9 +7,11 @@ parameters that every optimizer shares.
 
 TUNED (3 dimensions for every encoding):
 
-    w_scale       weight scale factor. Nevergrad searches in [-1, 1] and the
-                  vector is multiplied by w_scale before it reaches the
-                  projections, so w_scale replaces the old W_LOW / W_HIGH.
+    gain          dimensionless weight gain. Nevergrad searches in [-1, 1] and
+                  each projection is multiplied by gain / active_fan_in **
+                  FANIN_EXPONENT before it reaches the network, so gain replaces
+                  the old W_LOW / W_HIGH and is meant to transfer across
+                  topologies and n_per_dim. See WEIGHT SCALING below.
     r_max, r_min  rate-coding bounds (Hz)         -- rate / poprate
     lat_window    latency for normalized 0.0 (ms) -- latency / poplatency
     lat_min       latency for normalized 1.0 (ms) -- latency / poplatency
@@ -47,12 +49,18 @@ Previously the inner optimizer searched directly in [-20, 20]. Nevergrad's
 default step sizes are calibrated for a roughly unit-scale domain, so bounding
 at +-20 quietly changes the effective step size of every optimizer, and changes
 it by a different amount for each one. Searching a fixed [-1, 1] cube and
-applying w_scale afterwards keeps the search geometry identical across
-configurations, which means w_scale measures what you want it to measure -- the
-useful synaptic magnitude -- and not the optimizer's step size.
+scaling afterwards keeps the search geometry identical across configurations,
+which means the tuned gain measures what you want it to measure -- the useful
+synaptic magnitude -- and not the optimizer's step size.
 
 This also makes the sigma/bounds sensitivity question cleaner: sigma now lives
-in normalized units and w_scale is a separate, orthogonal knob.
+in normalized units and gain is a separate, orthogonal knob.
+
+The scaling is PER PROJECTION and divides by ACTIVE fan-in, so that one tuned
+gain transfers across the grid's 4 topologies x 4 n_per_dim values instead of
+needing 16 tuning runs per encoding. The reasoning and the trap in it are in the
+WEIGHT SCALING comment block below; screen_firing.py is what tests whether the
+transfer actually holds, and it runs with no optimizer involved.
 
 ------------------------------------------------------------------------------
 ONE CAVEAT BEFORE THE OUTPUT GOES IN THE THESIS
@@ -97,23 +105,31 @@ from optimize_snn import n_params, flat_to_weights, report_fitness
 T_STEP_FIXED = 50.0        # pinned, not tuned
 
 # --- cells to tune. hidden_sizes and n_per_dim are set BY HAND here. --------
+# The topology here should be one the MAIN GRID actually runs, otherwise the
+# tuned gain is fitted to a network that never appears in the results. The grid
+# uses (6,), (12,), (6,6), (10,4); 1L-large is the middle-of-the-road choice.
+# n_per_dim is the grid's midpoint of {5, 10, 20, 30}.
 CELLS = [
     dict(environment='mountaincar', encoding='poprate', decoding='vote',
-         hidden_sizes=[10], n_per_dim=5),
-    #dict(environment='acrobot', encoding='poplatency', decoding='first',
-        # hidden_sizes=[20], n_per_dim=5),
+         hidden_sizes=[12], n_per_dim=10),
+    dict(environment='mountaincar', encoding='poplatency', decoding='first',
+         hidden_sizes=[12], n_per_dim=10),
+    dict(environment='acrobot', encoding='poprate', decoding='vote',
+         hidden_sizes=[12], n_per_dim=10),
+    dict(environment='acrobot', encoding='poplatency', decoding='first',
+         hidden_sizes=[12], n_per_dim=10),
 ]
 
 # --- outer loop -------------------------------------------------------------
-OUTER_BUDGET    = 100       # configurations to evaluate (space is 1-3 dims)
-OUTER_OPTIMIZER = 'NgIohTuned'  # noise-aware; 'NGOpt' is a reasonable alternative
+OUTER_BUDGET    = 40       # configurations to evaluate (space is 1-3 dims)
+OUTER_OPTIMIZER = 'TBPSA'  # noise-aware; 'NGOpt' is a reasonable alternative
 
 # --- inner loop (cost driver) ----------------------------------------------
-INNER_OPTIMIZER      = 'RandomSearch'   # see the caveat in the module docstring
-INNER_BUDGET         = 2000    # weight evaluations per inner run
-INNER_EVAL_EPISODES  = 10      # episodes averaged per inner objective call
-K_INNER              = 1      # independent inner runs averaged to score a config
-TUNE_REPORT_EPISODES = 100     # report episodes per inner run
+INNER_OPTIMIZER      = 'DE'   # see the caveat in the module docstring
+INNER_BUDGET         = 150    # weight evaluations per inner run
+INNER_EVAL_EPISODES  = 1      # episodes averaged per inner objective call
+K_INNER              = 4      # independent inner runs averaged to score a config
+TUNE_REPORT_EPISODES = 20     # report episodes per inner run
 INNER_SIGMA          = 0.3    # mutation step, in units of the [-1, 1] cube
 
 # The new encoders take a `graded` mode. It is PINNED here rather than tuned,
@@ -129,21 +145,68 @@ SEED            = 0
 HOLDOUT_OFFSET  = 10_000      # held-out seed block for the honest re-score
 REPORT_SEED_GAP = 500_000     # keeps report episodes disjoint from training ones
 
-# --- search space bounds ----------------------------------------------------
-# Log-scaled. The current hardcoded setting is effectively 20, so this brackets
-# it by ~10x down and ~4x up. The FLOOR matters: Izhikevich RS has a rheobase
-# around I=4, so a w_scale much below ~2 means one presynaptic spike cannot
-# bring a postsynaptic neuron anywhere near threshold. Those configurations
-# produce silent networks, land on the censored fitness floor, and are
-# indistinguishable from each other -- the outer optimizer would spend its
-# budget mapping a flat dead region. Confirm the real floor for your neuron
-# parameters with a random-draw firing screen rather than trusting this number.
-W_SCALE_LO, W_SCALE_HI = 1.0, 40.0
-R_MAX_LO,   R_MAX_HI   = 50.0, 400.0  # log-scaled Hz
-R_MIN_FRAC_HI          = 0.3          # r_min = frac * r_max, so r_min < r_max
-LAT_WINDOW_LO          = 1.0
+# --- weight scaling ---------------------------------------------------------
+# The tuned quantity is a dimensionless GAIN, not a raw weight bound. Each
+# projection gets its own multiplier
+#
+#     scale_k = gain / active_fan_in_k ** FANIN_EXPONENT
+#
+# applied to the [-1, 1] search vector on its way into that projection. The
+# point is transfer: the main grid varies hidden width over (6,), (12,), (6,6),
+# (10,4) AND n_per_dim over {5, 10, 20, 30}, which is 16 combinations per
+# encoding. Tuning a raw weight bound per combination would be 64 tuning runs.
+# A gain expressed relative to fan-in is meant to transfer across all of them,
+# so 4 runs suffice -- but that is a HYPOTHESIS, and screen_firing.py is what
+# tests it. If the non-silent-fraction curves do not collapse across topology
+# once normalized, the transfer assumption is false and the affected cells need
+# their own tuned gain.
+#
+# ACTIVE fan-in, not total fan-in, and the difference matters enormously here.
+# encode_poprate and encode_poplatency write to ONE index per input dimension
+# (rates[d*n + k] = ...) and leave every other bin at rate_off / empty. So the
+# number of presynaptic neurons that actually fire into the first hidden layer
+# is n_entrada -- 2 for MountainCar, 6 for Acrobot -- regardless of whether
+# n_per_dim is 5 or 30. Dividing the input projection by sqrt(n_entrada *
+# n_per_dim) would shrink weights by sqrt(6) going from n_per_dim=5 to 30 and
+# push those networks below rheobase, and the conclusion "large populations do
+# not work" would be an artifact of the normalizer. Hidden->hidden and
+# hidden->output are not one-hot, so their full fan-in is the right denominator.
+FANIN_EXPONENT = 0.5    # 0.5 assumes zero-mean weights; 1.0 assumes correlated
+                        # same-sign weights. Optimized weights sit somewhere in
+                        # between, so this is an empirical question, not a
+                        # derivation. Sweep it in screen_firing.py.
+
+# Log-scaled. Wider than the old raw-weight range because a gain is divided by
+# sqrt(fan_in) before it reaches a projection: gain 20 on a 12-unit hidden layer
+# is an effective weight bound of 20/sqrt(12) = 5.8, not 20. Set these from the
+# firing screen rather than trusting the arithmetic -- the floor is where the
+# network goes silent (Izhikevich RS rheobase is around I=4) and the ceiling is
+# where it saturates into constant ties, and both depend on the real network.
+GAIN_LO, GAIN_HI = 3.0, 300.0
+
+# Legacy uniform scale, used ONLY by baseline_config(): W_LOW=-20 / W_HIGH=+20
+# on raw weights is exactly w_scale=20 applied uniformly to a [-1, 1] cube. The
+# baseline keeps that scheme so the paired comparison is against what the code
+# does today, not against a re-normalized version of it.
+W_SCALE_LEGACY = 20.0
+R_MAX_LO,   R_MAX_HI   = 50.0, 500.0  # log-scaled Hz
+R_MIN_FRAC_HI          = 0.5          # r_min = frac * r_max, so r_min < r_max
+LAT_WINDOW_LO          = 3.0
 LAT_MIN_FRAC           = (0.02, 0.60)         # of lat_window
-LAT_BURST_TAIL = 40.0
+
+# Tail = ms of extra spikes a single encoded value emits after its first spike.
+# BOTH are 0.0 now: encode_latency currently returns one spike time per input
+# dimension ([t_offset + lat] per dim, no lat+1 / lat+2), so the 3-spike burst
+# this used to compensate for is gone. If burst encoding comes back, set
+# 'latency' to 2.0 again -- spikes scheduled past the end of the simulated step
+# are dropped silently by ANNarchy, which is the difference between a config
+# that is bad and one that is broken in a way the fitness cannot distinguish
+# from bad.
+LAT_BURST_TAIL = {'latency': 0.0, 'poplatency': 0.0}
+
+
+def lat_window_hi(encoding):
+    return T_STEP_FIXED - LAT_BURST_TAIL.get(encoding, 2.0) - 2.0
 
 # --- housekeeping -----------------------------------------------------------
 OUT_DIR = 'tuning'
@@ -221,6 +284,51 @@ def snn_config(cfg, n_per_dim):
 
 
 # ============================================================================
+# WEIGHT SCALING
+# ============================================================================
+
+def active_fan_in(shapes, n_entrada):
+    """Presynaptic neurons that actually FIRE into each projection's post layer.
+
+    shapes[k] is (pre, post). For projections after the first, every pre neuron
+    can fire, so the full pre count is the fan-in. For the FIRST projection the
+    population encoders activate exactly one bin per input dimension, so only
+    n_entrada presynaptic neurons fire no matter how wide the place code is.
+    The scalar encoders also drive exactly n_entrada neurons (encode_rate has an
+    r_min floor so none are silent; encode_latency emits one spike each), so
+    n_entrada is correct for every encoding -- which is why this takes n_entrada
+    rather than the encoding name.
+    """
+    fans = [int(s[0]) for s in shapes]
+    fans[0] = int(n_entrada)
+    return fans
+
+
+def projection_scales(shapes, n_entrada, cfg):
+    """Per-projection multiplier for the [-1, 1] search vector."""
+    if cfg.get('w_mode', 'fanin') == 'uniform':
+        return [float(cfg['w_scale'])] * len(shapes)
+    gain = float(cfg['gain'])
+    return [gain / max(f, 1) ** float(FANIN_EXPONENT)
+            for f in active_fan_in(shapes, n_entrada)]
+
+
+def scaled_weights(flat, shapes, scales):
+    """Split the flat search vector and scale each projection by its own factor.
+
+    This cannot be done as one multiply before flat_to_weights, which is why the
+    old `flat * w_scale` call is gone: each projection needs a different factor.
+    """
+    flat = np.asarray(flat, dtype=float)
+    out, idx = [], 0
+    for (p, q), s in zip(shapes, scales):
+        size = p * q
+        out.append(flat[idx:idx + size].reshape(p, q) * float(s))
+        idx += size
+    return out
+
+
+# ============================================================================
 # SEARCH SPACE
 # ============================================================================
 
@@ -233,7 +341,7 @@ def active_params(encoding):
     and poplatency ignored its window, and both were dropped here. Every
     encoding is 3-dimensional now.
     """
-    p = ['w_scale']
+    p = ['gain']
     if encoding in ('rate', 'poprate'):
         p += ['r_max', 'r_min_frac']
     if encoding in ('latency', 'poplatency'):
@@ -244,11 +352,11 @@ def active_params(encoding):
 def build_space(encoding):
     """Instrumentation over the active parameters for this encoding."""
     full = dict(
-        w_scale     =ng.p.Log(lower=W_SCALE_LO, upper=W_SCALE_HI),
+        gain        =ng.p.Log(lower=GAIN_LO, upper=GAIN_HI),
         r_max       =ng.p.Log(lower=R_MAX_LO, upper=R_MAX_HI),
         r_min_frac  =ng.p.Scalar(lower=0.0, upper=R_MIN_FRAC_HI),
         lat_window  =ng.p.Scalar(lower=LAT_WINDOW_LO,
-                                 upper=LAT_BURST_TAIL),
+                                 upper=lat_window_hi(encoding)),
         lat_min_frac=ng.p.Scalar(lower=LAT_MIN_FRAC[0], upper=LAT_MIN_FRAC[1]),
     )
     return ng.p.Instrumentation(**{k: full[k] for k in active_params(encoding)})
@@ -280,7 +388,7 @@ def resolve(theta, encoding):
     r_min = float(theta.get('r_min_frac', g['R_MIN'] / g['R_MAX'])) * r_max
 
     lat_window = float(theta.get('lat_window',
-                                 min(g['LAT_WINDOW'], LAT_BURST_TAIL)))
+                                 min(g['LAT_WINDOW'], lat_window_hi(encoding))))
     if 'lat_min_frac' in theta:
         lat_min = float(np.clip(theta['lat_min_frac'] * lat_window,
                                 0.5, max(lat_window - 0.5, 0.5)))
@@ -288,7 +396,9 @@ def resolve(theta, encoding):
         lat_min = float(min(g['LAT_MIN'], max(lat_window - 0.5, 0.5)))
 
     return dict(
-        w_scale=float(theta.get('w_scale', 20.0)),
+        w_mode='fanin',
+        gain=float(theta.get('gain', 20.0)),
+        fanin_exponent=float(FANIN_EXPONENT),
         r_max=r_max,
         r_min=r_min,
         lat_window=lat_window,
@@ -300,13 +410,17 @@ def resolve(theta, encoding):
 def baseline_config():
     """The settings currently hardcoded in snn_feedforward / optimize_snn.
 
-    W_LOW=-20, W_HIGH=+20 on the raw weights is exactly w_scale=20 on a [-1, 1]
-    search cube, so the baseline is directly comparable to a tuned w_scale.
+    w_mode='uniform' on purpose. W_LOW=-20 / W_HIGH=+20 on raw weights is
+    w_scale=20 applied uniformly to every projection of a [-1, 1] cube, and
+    that is what the code does today. Scoring the baseline under fan-in
+    normalization instead would silently change the thing being compared
+    against, so the improvement figure would mix "better encoding parameters"
+    with "better weight scaling" and attribute both to tuning.
     """
-    from optimize_snn import W_HIGH
     g = DEFAULTS
     return dict(
-        w_scale=float(W_HIGH),
+        w_mode='uniform',
+        w_scale=float(W_SCALE_LEGACY),
         r_max=float(g['R_MAX']),
         r_min=float(g['R_MIN']),
         lat_window=float(g['LAT_WINDOW']),
@@ -319,12 +433,39 @@ def baseline_config():
 # INNER RUN AND CONFIG SCORING
 # ============================================================================
 
+_SIGMA_CHECKED = []
+
+
+def _check_sigma(param):
+    """Confirm sigma actually took, once per run.
+
+    Silencing the bounds warning by reordering is only correct if the sigma we
+    asked for is the sigma the parameter ends up with. If set_mutation had no
+    effect, the warning would be gone while the underlying problem -- mutations
+    spanning the whole cube and bouncing off the walls -- would remain. So read
+    it back rather than assuming.
+    """
+    if _SIGMA_CHECKED:
+        return
+    try:
+        sigma = float(np.asarray(param.sigma.value).ravel()[0])
+    except Exception as exc:
+        print("[sigma] could not read back sigma (%s)" % exc)
+        _SIGMA_CHECKED.append(None)
+        return
+    ratio = 2.0 / sigma
+    print("[sigma] requested=%.3f actual=%.3f -> bounds are %.1f sigma apart%s"
+          % (INNER_SIGMA, sigma, ratio,
+             "" if ratio >= 3.0 else "   <-- still below nevergrad's target of 3"))
+    _SIGMA_CHECKED.append(sigma)
+
+
 def run_inner(net, cfg, seed, inner_optimizer, inner_budget):
     """One weight optimization under a fixed encoding config.
 
-    The optimizer searches a normalized [-1, 1] cube; cfg['w_scale'] multiplies
-    the vector on its way into the projections. Returns the mean report fitness
-    of the recommended weights.
+    The optimizer searches a normalized [-1, 1] cube; each projection is then
+    multiplied by its own factor from projection_scales() on the way into the
+    network. Returns the mean report fitness of the recommended weights.
 
     Seeding, kept disjoint on purpose:
       training episodes use seeds  seed*1000 + j
@@ -335,21 +476,25 @@ def run_inner(net, cfg, seed, inner_optimizer, inner_budget):
     """
     shapes = net['shapes']
     dim = n_params(shapes)
-    scale = float(cfg['w_scale'])
+    scales = projection_scales(shapes, net['cfg']['n_entrada'], cfg)
 
     rng = np.random.default_rng(seed)
     init = rng.uniform(-1.0, 1.0, size=dim)
+
+    # ORDER MATTERS. ng.p.Array(init=...) starts at sigma=1.0, and set_bounds
+    # runs nevergrad's "at least 3 sigma between bounds" check immediately, at
+    # whatever sigma is set at that moment. Bounding first and mutating second
+    # checks 2.0/1.0 = 2.0 sigma and warns; setting sigma first checks
+    # 2.0/0.3 = 6.7 sigma and does not.
+    #
+    # Note ng.p.Scalar(lower=, upper=) does not have this problem because
+    # nevergrad infers sigma = range/6 when both bounds are passed to the
+    # constructor. INNER_SIGMA = 0.3 is deliberately close to that same
+    # convention (2.0/6 = 0.333), so this is nevergrad's own default geometry
+    # rather than a number I invented.
     param = ng.p.Array(init=init).set_mutation(sigma=INNER_SIGMA)
     param.set_bounds(-1.0, 1.0)
-    # ng.p.Array carries sigma=1.0 by default. On the old [-20, 20] domain that
-    # was a 1/40-of-range step; on this [-1, 1] cube it spans the whole domain
-    # and mutations bounce off the bounds constantly. Setting it explicitly is
-    # what actually makes the search geometry identical across configurations --
-    # normalizing the cube alone does not. INNER_SIGMA is now a free knob, so it
-    # belongs in the sigma/bounds sensitivity check rather than being inherited
-    # silently. Print param.sigma.value once to see what your nevergrad version
-    # does here before assuming this line changed anything.
-    
+    _check_sigma(param)
     param.random_state = np.random.RandomState(seed)   # pin the inner sampler
     np.random.seed(seed)                               # pin the silence stream
 
@@ -364,14 +509,14 @@ def run_inner(net, cfg, seed, inner_optimizer, inner_budget):
     train_seeds = [seed * 1000 + j for j in range(INNER_EVAL_EPISODES)]
 
     def objective(flat):
-        weights = flat_to_weights(np.asarray(flat) * scale, shapes)
+        weights = scaled_weights(flat, shapes, scales)
         # common random numbers within this inner run: every candidate is judged
         # on the same episodes, so differences are signal rather than luck
         vals = [evaluate(net, weights, episode_seed=s) for s in train_seeds]
         return -float(np.mean(vals))
 
     rec = optimizer.minimize(objective)
-    best = flat_to_weights(np.asarray(rec.value) * scale, shapes)
+    best = scaled_weights(rec.value, shapes, scales)
     return report_fitness(net, best, TUNE_REPORT_EPISODES,
                           episode_seed=seed + REPORT_SEED_GAP)['mean']
 
@@ -404,7 +549,10 @@ def _cell_tag(cell):
 
 def _fmt(cfg, keys):
     """One-line view of just the parameters this encoding actually uses."""
-    out = ['w=%.2f' % cfg['w_scale']]
+    if cfg.get('w_mode', 'fanin') == 'uniform':
+        out = ['w_unif=%.1f' % cfg['w_scale']]
+    else:
+        out = ['gain=%.1f' % cfg['gain']]
     if 'r_max' in keys:
         out.append('rmax=%.0f' % cfg['r_max'])
     if 'r_min_frac' in keys:
@@ -428,9 +576,7 @@ def tune(cell, args):
 
     keys = active_params(cell['encoding'])
     space = build_space(cell['encoding'])
-    space.real_world = True
-    space.hptuning=True
-    space.function.deterministic = False
+
     # topology and n_per_dim are fixed for this cell, so this is the ONLY
     # compile the whole tuning run performs
     compile_dir = ("annarchy/tune-%s-%s-%s-%s-n%d"
@@ -539,8 +685,16 @@ def tune(cell, args):
     _atomic_write(os.path.join(OUT_DIR, "result-%s.json" % tag), result)
 
     print("\n  best config   : %s" % _fmt(best_cfg, keys))
-    print("  effective weight range: [%.2f, %.2f]"
-          % (-best_cfg['w_scale'], best_cfg['w_scale']))
+    # what the tuned gain means as a raw weight bound, per projection -- this is
+    # the number to carry into the grid, and the per-projection spread is the
+    # whole point of normalizing
+    scales = projection_scales(net['shapes'], net['cfg']['n_entrada'], best_cfg)
+    fans = active_fan_in(net['shapes'], net['cfg']['n_entrada'])
+    print("  effective weight bound per projection (gain / active_fan_in^%.2f):"
+          % FANIN_EXPONENT)
+    for k, (shape, fan, s) in enumerate(zip(net['shapes'], fans, scales)):
+        print("    proj[%d] %s  active_fan_in=%-4d -> +/-%.2f"
+              % (k, shape, fan, s))
     print("  search score  : %.3f" % search_score)
     print("  holdout score : %.3f +/- %.3f" % (hmean, hstd))
     print("  baseline      : %.3f +/- %.3f" % (bmean, bstd))

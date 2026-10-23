@@ -10,13 +10,13 @@ from snn_feedforward import build_network, evaluate, weight_shapes
 # ---------- optimization configuration ----------
 OPTIMIZERS = ["NGOpt", "CMA", "DE", "PSO", "OnePlusOne", "TBPSA"]
 BUDGET  = 200      # function evaluations per optimizer (main cost knob)
-W_LOW  = -20.0     # weight search lower bound
-W_HIGH =  20.0 #this    # weight search upper bound (asymmetric, excitatory-skewed;
+W_LOW  = -40.0     # weight search lower bound
+W_HIGH =  40.0 #this    # weight search upper bound (asymmetric, excitatory-skewed;
                    # set from another NN's hyperparameters -- experimental)
 SEED    = 0        # seeds the shared initial point (fair across optimizers)
 REPORT_EPISODES = 100   # episodes averaged for the FINAL report only (not during
                        # optimization). Independent draws per optimizer.
-EVAL_EPISODES = 1     # number of episodes to measure weights
+EVAL_EPISODES = 10     # number of episodes to measure weights
 
 # ---------- flatten / unflatten ----------
 def n_params(shapes):
@@ -52,21 +52,24 @@ def report_fitness(net_handle, weights, n_episodes=REPORT_EPISODES,
     """
     n = int(n_episodes)
     if episode_seed is None:
-        fits = np.array([evaluate(net_handle, weights) for _ in range(n)],
-                        dtype=float)
+        runs = [evaluate(net_handle, weights, return_raw=True)
+                for _ in range(n)]
     else:
         base = int(episode_seed) * 1000  # spread blocks so they don't overlap
-        fits = np.array([evaluate(net_handle, weights, episode_seed=base + k)
-                         for k in range(n)], dtype=float)
+        runs = [evaluate(net_handle, weights, episode_seed=base + k,
+                         return_raw=True) for k in range(n)]
+    fits    = np.array([f for f, _ in runs], dtype=float)
+    rewards = np.array([r for _, r in runs], dtype=float)
     mean = float(fits.mean())
     std  = float(fits.std(ddof=1)) if n > 1 else 0.0
     sem  = std / np.sqrt(n) if n > 1 else 0.0
-    return dict(mean=mean, std=std, sem=sem, n=n, fitnesses=fits)
+    return dict(mean=mean, std=std, sem=sem, n=n, fitnesses=fits,
+                rewards=rewards, reward_mean=float(rewards.mean()))
 
 
 # ---------- run multiple optimizers ----------
 def optimize(environment, hidden_sizes, encoding, decoding,
-             optimizers=OPTIMIZERS, budget=BUDGET, trial=0):
+             optimizers=OPTIMIZERS, budget=BUDGET, trial=0, n_per_dim=None):
     """Compile the SNN once, then run each optimizer on its weights.
 
     Returns {optimizer_name: {'fitness'(=mean over REPORT_EPISODES), 'std',
@@ -81,8 +84,11 @@ def optimize(environment, hidden_sizes, encoding, decoding,
     compile_dir = ("annarchy/opt-%s-%s-%s-%s-t%d"
                    % (environment, encoding, decoding,
                       "x".join(str(h) for h in hidden_sizes), trial))
+    if n_per_dim is not None:
+        compile_dir += "-n%d" % int(n_per_dim)
     net = build_network(environment, hidden_sizes,
-                         encoding, decoding, compile_dir)
+                         encoding, decoding, compile_dir, n_per_dim=n_per_dim)
+    
     shapes = net['shapes']
     dim = n_params(shapes)
 
@@ -99,7 +105,7 @@ def optimize(environment, hidden_sizes, encoding, decoding,
         return fitness / EVAL_EPISODES
         
     # shared random start -> every optimizer begins from the same point
-    rng = np.random.default_rng(SEED)
+    rng = np.random.default_rng(SEED + int(trial))
     init = rng.uniform(W_LOW, W_HIGH, size=dim)
 
     results = {}
@@ -128,10 +134,13 @@ def optimize(environment, hidden_sizes, encoding, decoding,
 
         results[name] = dict(fitness=rep['mean'], std=rep['std'], sem=rep['sem'],
                              n_episodes=rep['n'], fitnesses=rep['fitnesses'],
+                             rewards=rep['rewards'],
+                             reward_mean=rep['reward_mean'],
                              opt_loss=opt_loss, weights=best_weights)
-        print("%-12s budget=%d  mean=%.3f  std=%.3f  sem=%.3f  (n=%d, opt=%.3f)"
+        print("%-12s budget=%d  mean=%.3f  std=%.3f  sem=%.3f  raw=%.2f  "
+              "(n=%d, opt=%.3f)"
               % (name, budget, rep['mean'], rep['std'], rep['sem'],
-                 rep['n'], -opt_loss))
+                 rep['reward_mean'], rep['n'], -opt_loss))
 
     return results
 
