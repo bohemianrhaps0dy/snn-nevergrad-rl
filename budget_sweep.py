@@ -3,18 +3,25 @@ budget_sweep.py -- what each evaluations-per-weight budget buys, what it costs, 
 largest budget rule the grid can afford in a time window.
 
 It runs the grid's own search on a few cells at several budgets and records, at every
-budget, the Gym score of each optimizer's recommendation and the wall time the run took
-to get there. From those times it predicts how long the whole grid (run_pipeline.py's
-GRID) takes under a rule budget = k x d, and finds the largest k that fits the window:
-one k for both environments, and one k per environment.
+budget, the Gym score of each optimizer's recommendation and the CPU time the run took to
+get there. From those times it predicts how long the whole grid (run_pipeline.py's GRID)
+takes on N cores under a rule budget = k x d, and finds the largest k that fits the
+window: one k for both environments, and one k per environment.
 
-    python budget_sweep.py --dry-run     # tasks and a time estimate; runs nothing
-    python budget_sweep.py --smoke       # a few minutes on tiny budgets, in budget_sweep_smoke/
-    mkdir -p logs && nohup python budget_sweep.py > logs/budget_sweep.log 2>&1 &
-    python budget_sweep.py --status      # progress and time left, from any shell
-    python budget_sweep.py --stop        # stop it and every run it started
-    python budget_sweep.py --summary     # score tables and the grid-time plan
-    python budget_sweep.py --summary --hours 24 --grid-optimizers 8
+    python budget_sweep.py --dry-run          # runs, and the sweep's time on 16 ... 288 cores
+    python budget_sweep.py --smoke            # a few minutes on tiny budgets, 4 at a time
+    mkdir -p logs && nohup python budget_sweep.py --cores 64 > logs/budget_sweep.log 2>&1 &
+    python budget_sweep.py --status           # progress and time left, from any shell
+    python budget_sweep.py --stop             # stop it and every run it started
+    python budget_sweep.py --summary          # score tables, and the largest k for 16 ... 288 cores
+    python budget_sweep.py --summary --cores 64 --hours 24 --grid-optimizers 8
+
+A SHARED SERVER. The sweep starts only with --cores N (or CORES set below): it keeps at
+most N runs going, one core each, at nice 10. With --leave-free M it also waits before
+starting a run while the machine's 1-minute load average leaves fewer than M cores idle,
+so it uses spare cores and gives them back as others start work. Costs are measured in
+CPU seconds, not wall seconds, so other people's jobs slowing the sweep down don't make
+the grid look more expensive than it is: the plan prices N cores of your own.
 
 Starting it again after a stop, a crash or a reboot continues where it was. While it
 runs, don't edit snn_feedforward.py or optimize_snn.py in this folder: every run that
@@ -61,22 +68,26 @@ scored on optimize_snn's report block of that trial (REPORT_EPISODES episodes): 
 reward, pass (>= -110 MountainCar, >= -100 Acrobot), random actions.
 
 What it times: the search itself (ask, tell and the training episodes) up to each level,
-apart from the compile and from each level's scoring, which are timed on their own.
+apart from the compile and from each level's scoring, which are timed on their own. Each
+is recorded in CPU seconds (what the plan prices) and in wall seconds (what --status
+uses for the time left). A run is single-threaded, so on an idle core the two agree; on
+a busy machine the wall time grows and the CPU time does not.
 
 ------------------------------------------------------------------------------
 THE PLAN (--summary)
 ------------------------------------------------------------------------------
-For each measured cell and optimizer the sweep gives T(k), the seconds a run of k x d
+For each measured cell and optimizer the sweep gives T(k), the CPU seconds a run of k x d
 evaluations takes (mean over seeds). A grid cell is priced from the measured cells of its
 environment and encoding: the mean seconds per evaluation, T(k) / (k d), is interpolated
 linearly in d, so the (6,6) and (10,4) topologies are priced by their number of weights.
 A grid task costs that, plus its compile and the ~216 episodes optimize() scores around
 the search. An optimizer the sweep did not run is priced as the mean of the six. The tasks
-(cell x trial x optimizer) are packed longest first on --cores workers, as
-experiment_runner.py hands them out, and the plan reports the largest k whose wall time
-fits --hours: one k for both environments, and the largest MountainCar k for each
-Acrobot k. The budget is clipped to run_pipeline.py's [budget_min, budget_max]. The
-tuning stage run_pipeline.py runs before the grid is priced the same way.
+(cell x trial x optimizer) are packed longest first on N cores, as experiment_runner.py
+hands them out, and the plan reports the largest k whose wall time fits --hours on N
+free cores: first for every N in CORE_COUNTS, then in detail (one k for both
+environments, and the largest MountainCar k for each Acrobot k) for --cores. The budget
+is clipped to run_pipeline.py's [budget_min, budget_max]. The tuning stage
+run_pipeline.py runs before the grid is priced the same way.
 
 Results: OUT_DIR/runs/<run>.json, one file per run, written only by that run and after
 every level, so --status and --summary can read a run that is still going. Starting the
@@ -130,8 +141,13 @@ SETTINGS_FILE = None        # make_grid_settings.py output for per-cell settings
 EVAL_EPISODES = None        # training episodes per evaluation; None = optimize_snn's
 REPORT_EPISODES = None      # report episodes per level; None = optimize_snn's
 SWEEP_TRIAL_OFFSET = 3000   # seed s runs as trial 3000 + s
-CORES = None                # runs at once; None = this machine's physical cores
+CORES = None                # runs at once. None: the sweep won't start without --cores N
+LEAVE_FREE = None           # with a number M: start a run only while the load average
+                            # leaves at least M cores idle (--leave-free)
 NICE = 10                   # lower priority, so the server stays usable
+CORE_COUNTS = (16, 32, 64, 96, 128, 192, 288)   # --dry-run and --summary show these
+BY_CORES_FIXED_K = (10, 20, 30, 40)   # --summary: the largest MountainCar k when Acrobot
+                                      # gets each of these
 ATTEMPTS = 2                # a run that fails is started again once
 
 # ---- the plan ----
@@ -549,6 +565,13 @@ def makespan(durations, workers):
     return end
 
 
+def children_cpu():
+    """CPU seconds of this process's finished child processes (and theirs)."""
+    import resource
+    r = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return r.ru_utime + r.ru_stime
+
+
 class EpisodeCounter:
     """Wraps snn_feedforward.evaluate() to count the training episodes and add up their raw
     reward. It asks evaluate() for the raw reward too and hands back exactly what the
@@ -583,7 +606,7 @@ def run_task(spec_path):
                   key=spec['key'], rows=[], done=False,
                   started=time.strftime('%Y-%m-%d %H:%M:%S'), host=os.uname().nodename)
     build = spec['build'] + '-p%d' % os.getpid()
-    t0 = time.time()
+    t0, cpu0, kids0 = time.time(), time.process_time(), children_cpu()
     try:
         with bare_argv(), contextlib.redirect_stdout(io.StringIO()):
             net = snn.build_network(env, c['hidden_sizes'], c['encoding'], c['decoding'],
@@ -595,6 +618,9 @@ def run_task(spec_path):
             raise RuntimeError("the network has %d weights, the plan says %d"
                                % (dim, spec['dim']))
         result['compile_seconds'] = round(time.time() - t0, 2)
+        # the compiler runs as child processes (cmake, make, g++): their CPU counts too
+        result['compile_cpu_seconds'] = round(time.process_time() - cpu0
+                                              + children_cpu() - kids0, 2)
         O.check_scoring_loop(net, shapes)       # the report scores what evaluate() scores
 
         counter = EpisodeCounter(O.evaluate)
@@ -606,16 +632,19 @@ def run_task(spec_path):
         per_weight = {int(round(k * dim)): float(k) for k in spec['marks']}
         scored = set(int(round(k * dim)) for k in spec['scored'])
         report_seed = int(O.REPORT_SEED) + trial          # optimize()'s report block
-        clock = dict(start=time.perf_counter(), paused=0.0)
+        clock = dict(start=time.perf_counter(), paused=0.0,
+                     cpu_start=time.process_time(), cpu_paused=0.0)
 
         def on_mark(count, x):
-            t_mark = time.perf_counter()
+            t_mark, cpu_mark = time.perf_counter(), time.process_time()
             row = dict(per_weight=per_weight[count], evals=count,
                        train_seconds=round(t_mark - clock['start'] - clock['paused'], 3),
+                       train_cpu_seconds=round(cpu_mark - clock['cpu_start']
+                                               - clock['cpu_paused'], 3),
                        train_episodes=counter.episodes,
                        train_raw_mean=round(counter.raw / max(1, counter.episodes), 3))
             if count in scored:
-                t_rep = time.perf_counter()
+                t_rep, cpu_rep = time.perf_counter(), time.process_time()
                 r = O.report_fitness(net, O.flat_to_weights(x, shapes),
                                      int(spec['report_episodes']), report_seed)
                 rewards = np.asarray(r['rewards'], dtype=float)
@@ -628,11 +657,13 @@ def run_task(spec_path):
                            silent=round(float(r['silent']), 4),
                            tied=round(float(r['tied']), 4),
                            passes=bool(r['reward_mean'] >= THRESHOLD[env]),
-                           report_seconds=round(time.perf_counter() - t_rep, 3))
+                           report_seconds=round(time.perf_counter() - t_rep, 3),
+                           report_cpu_seconds=round(time.process_time() - cpu_rep, 3))
             result['rows'].append(row)
             result['wall_seconds'] = round(time.time() - t0, 1)
             atomic_json(spec['result'], result)
             clock['paused'] += time.perf_counter() - t_mark
+            clock['cpu_paused'] += time.process_time() - cpu_mark
 
         atomic_json(spec['result'], result)
         rec, info, ran, n = search(spec['optimizer'], init, trial, int(spec['budget']),
@@ -781,12 +812,30 @@ def drop_lock():
             os.remove(lock)
 
 
-def cmd_run(cores):
+def machine_report():
+    """What this machine offers right now: cores, and how busy it is."""
+    phys = physical_cores()
+    try:
+        threads = len(os.sched_getaffinity(0))
+    except AttributeError:
+        threads = os.cpu_count() or phys
+    load = os.getloadavg()
+    idle = max(0, int(round(phys - load[0])))
+    return ("this machine: %d physical cores (%d hardware threads) open to this account; "
+            "load average %.1f / %.1f / %.1f over 1 / 5 / 15 minutes, so about %d %s idle "
+            "right now" % (phys, threads, load[0], load[1], load[2], idle,
+                           "core is" if idle == 1 else "cores are"))
+
+
+def cmd_run(cores, leave_free=None):
     take_lock()
     state = read_json(state_path(), {}) or {}
     st = state.setdefault('runs', {})
     state['launcher'] = dict(pid=os.getpid(), started=time.strftime('%Y-%m-%d %H:%M:%S'),
-                             cores=cores)
+                             cores=cores, leave_free=leave_free)
+    state['holding'] = None
+    phys = physical_cores()
+    log(machine_report())
     clean_builds()
     log("sweep: checking which optimizers ignore their budget, and the search loop")
     tasks = make_tasks()
@@ -808,10 +857,26 @@ def cmd_run(cores):
             st[t['tag']] = dict(status='waiting', attempts=0)
     rates = measured_rates()
     todo.sort(key=lambda t: -est_seconds(t, rates))   # longest first
-    log("sweep: %d runs, %d done, %d to run, %d still running from before; %d at a time"
-        % (len(tasks), len(tasks) - len(todo) - len(running), len(todo), len(running),
-           cores))
+    log("sweep: %d runs, %d done, %d to run, %d still running from before; at most %d at "
+        "a time%s" % (len(tasks), len(tasks) - len(todo) - len(running), len(todo),
+                      len(running), cores,
+                      "" if leave_free is None else
+                      ", and only while %d cores stay idle for others" % leave_free))
     atomic_json(state_path(), state)
+
+    def may_start():
+        """(start one more run now?, idle cores). With leave_free, the machine's 1-minute
+        load average must leave leave_free cores idle after the new run. The load average
+        catches up with a new process over about a minute, so each of our runs is counted
+        in it only as far as it has had time to show up (1 - exp(-age / 60 s))."""
+        if leave_free is None:
+            return True, None
+        now = time.time()
+        ours = sum(1.0 - math.exp(-max(0.0, now - st[tag].get('started_ts', now)) / 60.0)
+                   for tag in running)
+        others = max(0.0, os.getloadavg()[0] - ours)
+        idle = phys - others - len(running)
+        return idle - 1 >= leave_free, idle
 
     def on_signal(signum, frame):
         _STOPPING[0] = True
@@ -831,6 +896,17 @@ def cmd_run(cores):
     try:
         while todo or running:
             while todo and len(running) < cores:
+                ok, idle = may_start()
+                if not ok:
+                    if not state.get('holding'):
+                        log("sweep: about %.0f idle, %d cores to keep free: waiting before "
+                            "starting more runs (%d going)" % (idle, leave_free, len(running)))
+                        state['holding'] = ("waiting for idle cores since %s (%d kept free)"
+                                            % (time.strftime('%a %H:%M'), leave_free))
+                    break
+                if state.get('holding'):
+                    log("sweep: cores free again, starting runs")
+                    state['holding'] = None
                 t = todo.pop(0)
                 s = st.setdefault(t['tag'], {})
                 s['attempts'] = s.get('attempts', 0) + 1
@@ -926,8 +1002,13 @@ def clean_builds():
 def cmd_status(cores):
     state = read_json(state_path(), {}) or {}
     lock = read_json(out_path('launcher.pid'))
-    if lock and runs_this_script(lock.get('pid')):
-        head = "running (pid %s, started %s)" % (lock['pid'], lock.get('started'))
+    launcher = state.get('launcher') or {}
+    live = bool(lock and runs_this_script(lock.get('pid')))
+    if live:
+        head = "running (pid %s, started %s, at most %s at a time%s)" % (
+            lock['pid'], lock.get('started'), launcher.get('cores', '?'),
+            "" if launcher.get('leave_free') is None else
+            ", keeping %s cores free" % launcher['leave_free'])
     elif state:
         head = "NOT running (last stage: %s)" % state.get('stage', '?')
     else:
@@ -943,6 +1024,9 @@ def cmd_status(cores):
     waiting = [t for t in tasks if t not in done and t not in running and t not in failed]
     print("runs: %d/%d done, %d running, %d failed, %d waiting"
           % (len(done), len(tasks), len(running), len(failed), len(waiting)))
+    if live and state.get('holding'):
+        print("  %s" % state['holding'])
+    print("  %s" % machine_report())
     left_running = []
     if running:
         print("  %-62s %12s %9s %9s" % ('running', 'level', 'elapsed', 'left'))
@@ -983,9 +1067,9 @@ def cmd_dry_run(cores):
     tasks = make_tasks()
     describe_tests(tasks)
     rates = measured_rates()
-    print("\nbudget sweep: %d cells x %d optimizers x %d seeds -> %d runs (%d done), %d at "
-          "a time\n" % (len(sweep_cells()), len(OPTIMIZERS), SEEDS, len(tasks),
-                         sum(1 for t in tasks if finished(t)), cores))
+    print("\nbudget sweep: %d cells x %d optimizers x %d seeds -> %d runs (%d done)\n"
+          % (len(sweep_cells()), len(OPTIMIZERS), SEEDS, len(tasks),
+             sum(1 for t in tasks if finished(t))))
     print("  %-38s %5s  %-40s %9s %9s" % ('cell', 'd', 'budgets (evaluations)', 'runs',
                                           'longest'))
     for c in sweep_cells():
@@ -997,12 +1081,17 @@ def cmd_dry_run(cores):
                                              fmt_secs(max(est_seconds(t, rates)
                                                           for t in mine))))
     durations = [est_seconds(t, rates) for t in tasks if not finished(t)]
-    print("\n  ~%s core-hours -> about %s on %d cores (longest run %s). Priced by %s."
-          % ("{:,.0f}".format(sum(durations) / 3600), fmt_secs(makespan(durations, cores)),
-             cores, fmt_secs(max(durations) if durations else 0),
+    print("\n  ~%s core-hours, longest run %s. Priced by %s."
+          % ("{:,.0f}".format(sum(durations) / 3600),
+             fmt_secs(max(durations) if durations else 0),
              "the times measured so far" if rates else
              "EP_SECONDS %s s per episode of an untrained network: an upper bound, since "
              "trained networks end episodes sooner" % EP_SECONDS))
+    counts = [int(cores)] if cores else sorted(set(CORE_COUNTS))
+    print("  the sweep takes about:")
+    for n in counts:
+        print("    %4d cores  %s" % (n, fmt_secs(makespan(durations, n))))
+    print("\n%s" % machine_report())
 
 
 # ---------------------------------------------------------------- results
@@ -1035,7 +1124,8 @@ def scores(results):
 
 
 class CostModel:
-    """Training seconds of a run of k x d evaluations, from the sweep's times."""
+    """CPU seconds of a run of k x d evaluations, from the sweep's times (wall seconds for
+    a run saved before the sweep recorded CPU time)."""
 
     def __init__(self, results):
         grid_eval = float(modules()[1].EVAL_EPISODES)
@@ -1056,13 +1146,15 @@ class CostModel:
             scale = grid_eval / float(r['key'].get('eval_episodes') or grid_eval)
             for row in use:
                 o['points'].setdefault(float(row['per_weight']), []).append(
-                    float(row['train_seconds']) * scale)
-            if r.get('compile_seconds') is not None:
-                o['compile'].append(float(r['compile_seconds']))
+                    float(row.get('train_cpu_seconds', row['train_seconds'])) * scale)
+            comp = r.get('compile_cpu_seconds', r.get('compile_seconds'))
+            if comp is not None:
+                o['compile'].append(float(comp))
             n_rep = max(1, int(r['key'].get('report_episodes', 1)))
             for row in rows:
-                if row.get('report_seconds') is not None:
-                    o['report_ep'].append(float(row['report_seconds']) / n_rep)
+                rep = row.get('report_cpu_seconds', row.get('report_seconds'))
+                if rep is not None:
+                    o['report_ep'].append(float(rep) / n_rep)
         self.probed = sorted({n for v in self.cells.values() for n in v})
 
     def measured(self, key, name, k):
@@ -1205,7 +1297,7 @@ def clip_budget(k, d, grid):
 
 class Plan:
     """Wall time of the grid under a rule: the tasks priced by the CostModel, packed longest
-    first on `cores` workers."""
+    first on `cores` free cores (set .cores to price another number)."""
 
     def __init__(self, model, grid, names, cores):
         snn, O = modules()
@@ -1216,6 +1308,7 @@ class Plan:
         self.extra_episodes = 6 + 2 * int(O.REPORT_EPISODES) + int(O.EVAL_EPISODES)
         self.grid_eval = int(O.EVAL_EPISODES)
         self._cache = {}
+        self._tasks = {}
 
     def task(self, env, enc, d, name, k):
         """(seconds, extrapolated) of one grid task with k evaluations per weight."""
@@ -1227,22 +1320,30 @@ class Plan:
                                 extra)
         return self._cache[key]
 
+    def _durations(self, k_env):
+        key = tuple(sorted(k_env.items()))
+        if key not in self._tasks:
+            durations, extra, by_env = [], False, {}
+            for env, enc, hidden, n, d in self.cells:
+                for name in self.names:
+                    s, e = self.task(env, enc, d, name, k_env[env])
+                    durations += [s] * int(self.grid['trials'])
+                    by_env[env] = by_env.get(env, 0.0) + s * int(self.grid['trials']) / 3600
+                    extra = extra or e
+            self._tasks[key] = (sorted(durations, reverse=True), extra, by_env)
+        return self._tasks[key]
+
     def evaluate(self, k_env):
         """{wall, core_hours, by_env, longest, extrapolated} for k_env = {env: k}."""
-        durations, extra, by_env = [], False, {}
-        for env, enc, hidden, n, d in self.cells:
-            for name in self.names:
-                s, e = self.task(env, enc, d, name, k_env[env])
-                durations += [s] * int(self.grid['trials'])
-                by_env[env] = by_env.get(env, 0.0) + s * int(self.grid['trials']) / 3600
-                extra = extra or e
+        durations, extra, by_env = self._durations(k_env)
         return dict(wall=makespan(durations, self.cores), core_hours=sum(durations) / 3600,
-                    by_env=by_env, longest=max(durations), extrapolated=extra,
+                    by_env=by_env, longest=durations[0], extrapolated=extra,
                     tasks=len(durations))
 
     def largest(self, window, fixed=None, vary=None, k_max=100.0, step=1.0):
         """The largest k (in `step`s up to k_max) for the environments in `vary` (all if
-        None) whose wall time fits `window`; `fixed` holds the other environments' k."""
+        None) whose wall time fits `window`; `fixed` holds the other environments' k. The
+        wall time grows with k, so the scan stops once it is well past the window."""
         envs = self.grid['environments']
         vary = list(vary or envs)
         best = None
@@ -1253,6 +1354,8 @@ class Plan:
             r = self.evaluate(k_env)
             if r['wall'] <= window:
                 best = (k, r)
+            elif r['wall'] > 1.05 * window:
+                break
             k += step
         return best
 
@@ -1313,7 +1416,7 @@ def print_scores(results):
             print("\n%s | %s | hidden %s, %d per observation | d=%d | pass: raw >= %g"
                   % (env, ck[1], ck[2], ck[3], ck[4], THRESHOLD[env]))
             print("  %-13s" % 'optimizer' + "".join("%11s" % ("%gxd" % L) for L in levels)
-                  + "   ms/eval")
+                  + "  cpu ms/eval")
             model = CostModel([r for r in results if (r['task']['cell']['environment'],
                                                       r['task']['cell']['encoding'],
                                                       int(r['task']['dim'])) ==
@@ -1331,7 +1434,7 @@ def print_scores(results):
                     cells_.append("%11s" % ("%d/%d %4.0f" % (sum(x['passes'] for x in rows),
                                                             len(rows), np.median(raws))))
                 T, _ = model.measured((ck[0], ck[1], ck[4]), name, levels[-1])
-                ms = "%9.1f" % (1000 * T / (levels[-1] * ck[4])) if T else "%9s" % '-'
+                ms = "%13.1f" % (1000 * T / (levels[-1] * ck[4])) if T else "%13s" % "-"
                 note = "  (one run per budget)" if 'per-level' in rows_meta[ck][name] else ""
                 print("  %-13s" % name + "".join(cells_) + ms + note)
     print("\n=== BEST OF THE SIX: median raw of the best optimizer at each budget ===")
@@ -1375,22 +1478,24 @@ def cmd_summary(hours, cores, grid_optimizers, k_max=None):
             names = ['(mean of the six)'] * int(grid_optimizers)
         else:
             names = [x.strip() for x in str(grid_optimizers).split(',') if x.strip()]
-    plan = Plan(model, grid, names, cores)
+    detail = int(cores or max(CORE_COUNTS))
+    plan = Plan(model, grid, names, detail)
     window = float(hours) * 3600
     top = max(max(LEVELS[e]) for e in grid['environments'] if e in LEVELS)
     k_max = float(k_max or top)
     n_tasks = len(plan.cells) * int(grid['trials']) * len(names)
-    print("\n=== GRID TIME: %s's GRID, %d cells x %d trials x %d optimizers = %d tasks on %d "
-          "cores, window %gh ===" % (PIPELINE_FILE if found else 'DEFAULT_GRID (no %s here)'
-                                     % PIPELINE_FILE, len(plan.cells), int(grid['trials']),
-                                     len(names), n_tasks, cores, hours))
+    print("\n=== GRID TIME: %s's GRID, %d cells x %d trials x %d optimizers = %d tasks, "
+          "window %gh ===" % (PIPELINE_FILE if found else 'DEFAULT_GRID (no %s here)'
+                              % PIPELINE_FILE, len(plan.cells), int(grid['trials']),
+                              len(names), n_tasks, hours))
     print("optimizers priced: %s%s" % (", ".join(sorted(set(names))),
                                        "" if grid_optimizers else
                                        " (the sweep's six; --grid-optimizers to change)"))
     measured = {env: sorted({x[2] for x in model.cells if x[0] == env})
                 for env in grid['environments']}
-    print("cost: measured at d = %s, interpolated in d for the other cells; budget = "
-          "clip(k x d, %s, %s); * = cost beyond the largest level measured"
+    print("cost: CPU time measured at d = %s, interpolated in d for the other cells; budget "
+          "= clip(k x d, %s, %s); * = cost beyond the largest level measured. Wall times "
+          "assume free cores, one task each."
           % ("; ".join("%s (%s)" % (", ".join(map(str, v)), e) for e, v in measured.items()),
              grid.get('budget_min'), grid.get('budget_max')))
     print("solved = measured cells where some optimizer's median passes at the largest "
@@ -1408,8 +1513,45 @@ def cmd_summary(hours, cores, grid_optimizers, k_max=None):
     envs = grid['environments']
     name_of = {'mountaincar': 'MountainCar', 'acrobot': 'Acrobot'}
     lab = lambda e: name_of.get(e, e)
+    pair = (('acrobot', 'mountaincar') if set(envs) == {'acrobot', 'mountaincar'}
+            else (tuple(envs) if len(envs) == 2 else None))
+
+    # ---- the answer for every number of cores ----
+    counts = sorted(set(CORE_COUNTS) | ({int(cores)} if cores else set()))
+    fixed_ks = [float(x) for x in BY_CORES_FIXED_K]
+    print("\nLARGEST k THAT FITS %gh, BY THE FREE CORES THE GRID GETS" % hours)
+    head = "  %6s %9s %10s %10s" % ('cores', 'one k', 'grid wall', 'tuning >=')
+    if pair:
+        head += "   " + "".join("%14s" % ("%s %g:" % (lab(pair[0]), ka)) for ka in fixed_ks)
+    print(head)
+    if pair:
+        print("  %38s   %s" % ('', "".join("%14s" % ("%s k" % lab(pair[1])) for _ in fixed_ks)))
+    for n in counts:
+        plan.cores = n
+        best = plan.largest(window, k_max=k_max)
+        if best:
+            k, r = best
+            row = "  %6d %9s %10s %10s" % (
+                n, ("%g" % k) + ("+" if k >= k_max else ""), fmt_secs(r['wall']),
+                tune_col({e: k for e in envs}))
+        else:
+            row = "  %6d %9s %10s %10s" % (n, '-', '', '')
+        if pair:
+            cols = []
+            for ka in fixed_ks:
+                res = plan.largest(window, fixed={pair[0]: ka}, vary=[pair[1]], k_max=k_max)
+                cols.append("%14s" % ((("%g" % res[0]) + ("+" if res[0] >= k_max else ""))
+                                      if res else '-'))
+            row += "   " + "".join(cols)
+        print(row + ("   <- --cores" if cores and n == int(cores) else ""))
+    print("  - = doesn't fit even at k = 1; + = stopped at k_max = %g (--k-max looks "
+          "further, at extrapolated cost)" % k_max)
+    plan.cores = detail
+
     ks = sorted(set([float(x) for e in envs for x in LEVELS.get(e, ())] +
                     [float(grid.get('evals_per_dim') or 0)]) - {0.0})
+    print("\nON %d CORES%s" % (detail, "" if cores else
+                              " (the largest count above; --cores N for yours)"))
     print("\nONE k FOR BOTH ENVIRONMENTS")
     print("  %5s %9s %13s %11s %s %10s   %s"
           % ('k', 'wall', 'longest task', 'core-hours',
@@ -1435,9 +1577,8 @@ def cmd_summary(hours, cores, grid_optimizers, k_max=None):
     else:
         print("  -> no k from 1 up fits %gh" % hours)
 
-    if len(envs) == 2:
-        a, b = ('acrobot', 'mountaincar') if set(envs) == {'acrobot', 'mountaincar'} \
-            else (envs[0], envs[1])
+    if pair:
+        a, b = pair
         print("\nONE k PER ENVIRONMENT: the largest %s k for each %s k" % (lab(b), lab(a)))
         print("  %11s %15s %9s %11s %10s   %-17s %-17s"
               % (lab(a) + ' k', lab(b) + ' k', 'wall', 'core-hours', 'tuning >=',
@@ -1472,8 +1613,11 @@ def main():
     ap.add_argument('--hours', type=float, default=HOURS,
                     help='the window the grid must fit (default %g)' % HOURS)
     ap.add_argument('--cores', type=int, default=None,
-                    help='runs at once, and the cores the plan packs the grid on '
-                         '(default: CORES, or the physical cores)')
+                    help='runs at once (needed to start the sweep), and the cores the plan '
+                         'details for the grid (default: CORES)')
+    ap.add_argument('--leave-free', type=int, default=None,
+                    help='start a run only while the load average leaves this many cores '
+                         'idle for others (default: LEAVE_FREE, off)')
     ap.add_argument('--grid-optimizers', default=None,
                     help='the grid\'s optimizers for the plan: a number, or names '
                          'separated by commas (default: the sweep\'s six)')
@@ -1490,20 +1634,29 @@ def main():
         LEVELS, PER_RUN_LEVELS = SMOKE['LEVELS'], SMOKE['PER_RUN_LEVELS']
         EVAL_EPISODES, REPORT_EPISODES = SMOKE['EVAL_EPISODES'], SMOKE['REPORT_EPISODES']
         OUT_DIR = SMOKE['OUT_DIR']
-    cores = args.cores or CORES or physical_cores()
-    if (args.status or args.summary or args.dry_run) and not args.cores and not CORES:
-        launched = ((read_json(state_path(), {}) or {}).get('launcher') or {}).get('cores')
-        cores = launched or cores      # the cores the sweep runs on, not this shell's
+    given = args.cores or CORES
+    launched = ((read_json(state_path(), {}) or {}).get('launcher') or {}).get('cores')
+    leave_free = args.leave_free if args.leave_free is not None else LEAVE_FREE
     if args.stop:
         cmd_stop()
     elif args.status:
-        cmd_status(cores)
+        cmd_status(given or launched or physical_cores())
     elif args.dry_run:
-        cmd_dry_run(cores)
+        cmd_dry_run(given)                    # None: the sweep's time for every CORE_COUNTS
     elif args.summary:
-        cmd_summary(args.hours, cores, args.grid_optimizers, args.k_max)
+        cmd_summary(args.hours, given or launched, args.grid_optimizers, args.k_max)
     else:
-        cmd_run(cores)
+        if args.smoke and not given:
+            given = min(4, physical_cores())
+        if not given:
+            raise SystemExit(
+                "budget_sweep.py starts only when you say how many runs it may keep going "
+                "at once: --cores N (one core each, at nice %d). Add --leave-free M to "
+                "wait whenever fewer than M cores are idle. --dry-run shows how long the "
+                "sweep takes on %s cores.\n%s"
+                % (NICE, ", ".join(str(n) for n in sorted(set(CORE_COUNTS))),
+                   machine_report()))
+        cmd_run(int(given), leave_free)
 
 
 if __name__ == '__main__':
