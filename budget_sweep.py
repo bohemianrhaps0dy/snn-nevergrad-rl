@@ -597,6 +597,10 @@ def run_task(spec_path):
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(143))
     snn, O = modules()
     apply_settings(spec['settings'])
+    # the parametrization the launcher planned with (search_key): the same values as
+    # optimize_snn.py's own unless a wrapper such as sigma_check.py set other ones
+    O.PARAM_SIGMA = spec['key'].get('param_sigma', O.PARAM_SIGMA)
+    O.PARAM_NOISY = spec['key'].get('param_noisy', O.PARAM_NOISY)
     c = spec['cell']
     env = c['environment']
     trial = int(spec['trial'])
