@@ -1,15 +1,23 @@
 """
-run_pipeline.py -- tune every cell of the grid, then run the grid on the tuned settings,
+run_pipeline.py -- tune the grid's cells, then run the grid on the tuned settings,
 unattended. Put it next to your code (snn_feedforward.py, optimize_snn.py,
 tune_hyperparams.py, make_grid_settings.py, experiment_runner.py) and start it there.
 
-  1. TUNING    tune_hyperparams.py once per grid cell (the cells in GRID below), as many
-               cells side by side as the cores hold, longest cells first. A cell writes
+  1. TUNING    tune_hyperparams.py once per tuned cell, as many cells side by side as the
+               cores hold, longest cells first. With TUNE_N = 4 the tuned cells are the
+               grid's cells with 4 neurons per observation, one per environment x encoding x
+               topology; TUNE_N = None tunes every cell of GRID. A cell writes
                TUNING_DIR/result-<cell>.json when it ends. A finished cell is skipped, a
                cell that was interrupted continues from its last finished batch, and a
                cell whose run fails is started again (ATTEMPTS runs in total).
-  2. SETTINGS  make_grid_settings.py --always-tuned: every cell gets its tuned values,
-               with no held-out test (the comparison stays in the file for the record).
+  2. SETTINGS  make_grid_settings.py --always-tuned: every tuned cell gets its tuned
+               values, with no held-out test (the comparison stays in the file for the
+               record). With TUNE_N, every other cell then gets the values of the tuned
+               cell with the same environment, encoding and topology, and its 'source'
+               says so ("tuned, shared from n4"), which experiment_runner.py records in
+               every result. Why n can share: the place code fires exactly one input
+               neuron per observation whatever n is, so n changes which weights are used,
+               not how much drive a hidden neuron gets.
   3. GRID      experiment_runner.py over the same cells with those settings, the budget
                rule in GRID and the optimizers listed in OPTIMIZERS_FILE. That list is read
                when the grid starts, so it can change while the tuning runs; names added
@@ -59,6 +67,9 @@ GRID = dict(
 TUNE_EVALS_PER_DIM = None   # the tuner's inner budget per weight (same clip). None = the
                             # grid's budget, so tuning scores the grid's own search.
                             # 20 makes the tuning about 5x cheaper.
+TUNE_N = 4                  # tune only the cells with this many neurons per observation;
+                            # the other n of the same environment, encoding and topology
+                            # run on their settings. None = tune every cell of GRID.
 TUNER_ARGS = []             # extra tune_hyperparams.py flags for every cell
 OPTIMIZERS_FILE = 'optimizers.txt'        # one Nevergrad name per line, read at grid start
 DEFAULT_OPTIMIZERS = ['TwoPointsDE', 'NoisyRL3']   # written there if the file is missing
@@ -77,11 +88,13 @@ POLL_SECONDS = 20
 EP_SECONDS = {'mountaincar': 0.018, 'acrobot': 0.065}   # first estimate; --status uses
                                                         # the times the tuning measures
 
-# --smoke: the whole pipeline on 4 cells and tiny budgets, in its own folder
+# --smoke: the whole pipeline on 8 cells (4 tuned, 4 sharing) and tiny budgets, in its
+# own folder
 SMOKE = dict(
     GRID=dict(environments=['mountaincar', 'acrobot'], encodings=['poprate', 'poplatency'],
-              decoding='first', topologies=[[6]], n_per_dim=[2], trials=1,
+              decoding='first', topologies=[[6]], n_per_dim=[2, 4], trials=1,
               generator='regular', evals_per_dim=0.5, budget_min=10, budget_max=40),
+    TUNE_N=2,
     TUNER_ARGS=['--quick'],
     ROOT='pipeline_smoke',
 )
@@ -275,6 +288,9 @@ def preflight():
             if flag not in f.read():
                 problems.append("%s has no %s option: copy the new %s here"
                                 % (name, flag.strip("'"), name))
+    if TUNE_N is not None and int(TUNE_N) not in [int(n) for n in GRID['n_per_dim']]:
+        problems.append("TUNE_N = %s is not one of GRID's n_per_dim %s"
+                        % (TUNE_N, GRID['n_per_dim']))
     return problems
 
 
@@ -429,10 +445,34 @@ def make_cells(cores):
     return cells
 
 
-def settings_key(cell):
+def settings_key(cell, n=None):
+    """The cell's key in the settings file; with n, the key of the same cell at n."""
     c = cell.cell
     return "%s|%s|%s|%s|n%d" % (c['environment'], topo(c['hidden_sizes']), c['encoding'],
-                                c['decoding'], c['n_per_dim'])
+                                c['decoding'], c['n_per_dim'] if n is None else int(n))
+
+
+def tuning_cells(cells):
+    """The cells the tuning runs: those with TUNE_N neurons per observation, or all."""
+    if TUNE_N is None:
+        return list(cells)
+    return [c for c in cells if c.cell['n_per_dim'] == int(TUNE_N)]
+
+
+def tuned_on(cell):
+    """The settings key of the tuned cell whose values `cell` runs on."""
+    return settings_key(cell) if TUNE_N is None else settings_key(cell, TUNE_N)
+
+
+def tuning_scope(cells):
+    """One line on which cells are tuned."""
+    tuned = tuning_cells(cells)
+    if TUNE_N is None:
+        return "%d cells, every cell of the grid" % len(tuned)
+    others = sorted({c.cell['n_per_dim'] for c in cells} - {int(TUNE_N)})
+    return ("%d of the grid's %d cells: n%d of every environment x encoding x topology; "
+            "n%s run on them" % (len(tuned), len(cells), int(TUNE_N),
+                                 ", n".join(str(n) for n in others)))
 
 
 # ---------------------------------------------------------------- optimizers
@@ -706,13 +746,36 @@ def run_settings(cells):
         log("settings: make_grid_settings.py failed (code %s) | %s"
             % (proc.returncode, _tail(p(LOG_DIR, 'settings.log'), 3)))
         return None
-    cells_in = (read_json(p(SETTINGS_FILE)) or {}).get('cells', {})
+    data = read_json(p(SETTINGS_FILE)) or {}
+    cells_in = data.get('cells', {})
+    if TUNE_N is not None:
+        shared = 0
+        for c in cells:
+            key, src = settings_key(c), tuned_on(c)
+            if key == src:
+                continue
+            cells_in.pop(key, None)       # a cell of another n never runs on its own result
+            if src in cells_in:
+                entry = dict(cells_in[src])
+                entry.update(source="%s, shared from n%d" % (entry.get('source', 'tuned'),
+                                                             int(TUNE_N)),
+                             tuned_on=src)
+                cells_in[key] = entry
+                shared += 1
+        data['cells'] = cells_in
+        data['shared'] = ("TUNE_N = %d: a cell with another n_per_dim runs on the settings "
+                          "tuned at n%d of the same environment, encoding and topology "
+                          "(its 'tuned_on')" % (int(TUNE_N), int(TUNE_N)))
+        atomic_json(p(SETTINGS_FILE), data)
+        log("settings: %d tuned cells; %d cells with another n run on their settings"
+            % (len(tuning_cells(cells)), shared))
     missing = [settings_key(c) for c in cells if settings_key(c) not in cells_in]
     log("settings: %s has tuned values for %d of the grid's %d cells"
         % (os.path.relpath(p(SETTINGS_FILE), ROOT), len(cells) - len(missing), len(cells)))
     for k in missing:
-        log("settings: WARNING %s has no tuning result; the grid runs it on the current "
-            "module settings" % k)
+        log("settings: WARNING %s has no tuning result%s; the grid runs it on the current "
+            "module settings" % (k, "" if TUNE_N is None else " (from its n%d cell)"
+                                 % int(TUNE_N)))
     return missing
 
 
@@ -850,13 +913,15 @@ def cmd_run(args, cores):
 
     try:
         cells = make_cells(cores)
-        log("pipeline: %d tuning cells, then the grid with %s x %d trials; %d cores; "
-            "results in %s" % (len(cells), ", ".join(names), GRID['trials'], cores, ROOT))
+        tcells = tuning_cells(cells)
+        log("pipeline: tuning %s; then the grid of %d cells with %s x %d trials; %d cores; "
+            "results in %s" % (tuning_scope(cells), len(cells), ", ".join(names),
+                               GRID['trials'], cores, ROOT))
         state['stage'] = 'tuning'
         save_state(state)
-        if not run_tuning(cells, cores, state):
+        if not run_tuning(tcells, cores, state):
             return
-        failed = [c.tag for c in cells if state['cells'][c.tag]['status'] == 'failed']
+        failed = [c.tag for c in tcells if state['cells'][c.tag]['status'] == 'failed']
         if failed:
             log("tuning: %d cells failed: %s" % (len(failed), ", ".join(failed)))
         state['stage'] = 'settings'
@@ -900,16 +965,17 @@ def cmd_status(cores):
     else:
         head = "not started yet"
     print("pipeline in %s: %s" % (ROOT, head))
-    ep_s, n_meas = measured_ep_seconds(cells)
-    finished = [c for c in cells if c.finished()]
-    running = [c for c in cells if st.get(c.tag, {}).get('status') == 'running'
+    tcells = tuning_cells(cells)
+    ep_s, n_meas = measured_ep_seconds(tcells)
+    finished = [c for c in tcells if c.finished()]
+    running = [c for c in tcells if st.get(c.tag, {}).get('status') == 'running'
                and alive(st[c.tag].get('pid')) and not c.finished()]
-    failed = [c for c in cells if st.get(c.tag, {}).get('status') == 'failed']
+    failed = [c for c in tcells if st.get(c.tag, {}).get('status') == 'failed']
     for c in running:
         _STARTED[c.tag] = st[c.tag].get('started_ts', time.time())
-    print("tuning: %d/%d cells done, %d running, %d failed, %d waiting"
-          % (len(finished), len(cells), len(running), len(failed),
-             len(cells) - len(finished) - len(running) - len(failed)))
+    print("tuning: %d/%d cells done, %d running, %d failed, %d waiting  (%s)"
+          % (len(finished), len(tcells), len(running), len(failed),
+             len(tcells) - len(finished) - len(running) - len(failed), tuning_scope(cells)))
     if running:
         print("  %-48s %9s %13s %10s" % ('running', 'configs', 'this batch', 'cell left'))
         now = time.time()
@@ -930,8 +996,8 @@ def cmd_status(cores):
     g = state.get('grid', {})
     tasks = grid_task_seconds(cells, max(1, len(names)), ep_s)
     grid_wall = makespan(tasks, cores)
-    if len(finished) < len(cells):
-        left = simulate_tuning(cells, cores, ep_s, running=running)
+    if len(finished) < len(tcells):
+        left = simulate_tuning(tcells, cores, ep_s, running=running)
         print("  tuning left: about %s" % fmt_secs(left))
         print("grid: not started; will run %s (from %s) x %d trials: %d tasks, about %s"
               % (", ".join(names), os.path.relpath(path, ROOT), GRID['trials'],
@@ -982,6 +1048,7 @@ def cmd_dry_run(cores):
         if any('missing' in x or 'older' in x for x in problems):
             return
     cells = make_cells(cores)
+    tcells = tuning_cells(cells)
     names, path = read_optimizers()
     problem = check_optimizers(names, path)
     shape = tuner_shape()
@@ -992,24 +1059,25 @@ def cmd_dry_run(cores):
         inner = "the grid's budget for the cell"
     else:
         inner = "%g x d" % TUNE_EVALS_PER_DIM
-    print("TUNING: %d cells | tune_hyperparams.py: %s over %d configs in batches of up "
+    print("TUNING: %s | tune_hyperparams.py: %s over %d configs in batches of up "
           "to %d, K=%d inner runs each, %d training episodes per evaluation; inner budget "
-          "= %s" % (len(cells), shape.outer_optimizer, shape.outer_budget, cells[0].batch,
-                    shape.k_inner, shape.eval_episodes, inner))
+          "= %s" % (tuning_scope(cells), shape.outer_optimizer, shape.outer_budget,
+                    tcells[0].batch, shape.k_inner, shape.eval_episodes, inner))
     print("  %-44s %5s %8s %8s %9s %10s %8s" % ('cell', 'd', 'inner', 'grid', 'one run',
                                                'cell wall', 'state'))
-    for c in sorted(cells, key=lambda c: -c.seconds_left(EP_SECONDS)):
+    for c in sorted(tcells, key=lambda c: -c.seconds_left(EP_SECONDS)):
         print("  %-44s %5d %8d %8d %9s %10s %8s"
               % (c.tag, c.dim, c.budget, c.grid_budget, fmt_secs(c.run_seconds(EP_SECONDS)),
                  fmt_secs(c.seconds_left(EP_SECONDS)),
                  'done' if c.finished() else ('started' if os.path.exists(c.ckpt) else '-')))
-    core_h = sum(sum(s * c.K for s in c.sizes) * c.run_seconds(EP_SECONDS) for c in cells) / 3600
-    tune_wall = simulate_tuning(cells, cores, EP_SECONDS)
+    core_h = sum(sum(s * c.K for s in c.sizes) * c.run_seconds(EP_SECONDS)
+                 for c in tcells) / 3600
+    tune_wall = simulate_tuning(tcells, cores, EP_SECONDS)
     tasks = grid_task_seconds(cells, max(1, len(names)), EP_SECONDS)
     grid_wall = makespan(tasks, cores)
     print("\n  tuning: ~%s core-hours -> about %s on %d cores (longest cells first, %d "
           "workers per cell)" % ("{:,.0f}".format(core_h), fmt_secs(tune_wall), cores,
-                                  cells[0].workers))
+                                  tcells[0].workers))
     print("GRID: %d cells x %d trials x %d optimizers (%s, from %s%s) = %d tasks, "
           "budget %g x d in [%s, %s]"
           % (len(cells), GRID['trials'], len(names), ", ".join(names),
@@ -1025,7 +1093,7 @@ def cmd_dry_run(cores):
 
 
 def main():
-    global GRID, TUNER_ARGS, ROOT
+    global GRID, TUNER_ARGS, ROOT, TUNE_N
     ap = argparse.ArgumentParser(description=__doc__, allow_abbrev=False,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dry-run', action='store_true', help='plan and time estimate only')
@@ -1041,6 +1109,7 @@ def main():
 
     if args.smoke:
         GRID = dict(SMOKE['GRID'])
+        TUNE_N = SMOKE['TUNE_N']
         TUNER_ARGS = list(SMOKE['TUNER_ARGS'])
         ROOT = os.path.join(CODE_DIR, SMOKE['ROOT'])
         os.makedirs(ROOT, exist_ok=True)
