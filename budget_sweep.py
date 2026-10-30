@@ -1172,16 +1172,31 @@ class CostModel:
         slope = ((Ts[-1] - Ts[-2]) / (ks[-1] - ks[-2])) if len(ks) > 1 else Ts[-1] / ks[-1]
         return Ts[-1] + slope * (k - ks[-1]), True
 
+    def _timed(self, key, name=None):
+        """Has cell `key` (optimizer `name`, or any) a measured time yet? A run that has
+        started but not reached its first level has none."""
+        opts = self.cells.get(key, {})
+        if name is not None:
+            return bool(opts.get(name, {}).get('points'))
+        return any(o['points'] for o in opts.values())
+
     def _keys(self, env, enc):
-        keys = sorted(x for x in self.cells if x[0] == env and x[1] == enc)
-        return keys or sorted(x for x in self.cells if x[0] == env)
+        """The measured cells of this environment and encoding, or of the environment when
+        that encoding has none yet."""
+        keys = sorted(x for x in self.cells if x[0] == env and x[1] == enc and self._timed(x))
+        return keys or sorted(x for x in self.cells if x[0] == env and self._timed(x))
+
+    def ready(self, envs, encs):
+        """The (environment, encoding) pairs the plan can't price yet."""
+        return [(e, c) for e in envs for c in encs if not self._keys(e, c)]
 
     def train_seconds(self, env, enc, d, name, k):
         """T for any cell: the mean seconds per evaluation, T(k) / (k d), of the measured
         cells of this environment and encoding, interpolated linearly in d. An optimizer
-        the sweep did not run is priced as the mean of those it ran."""
+        without a measured time (not in the sweep, or not past its first level yet) is
+        priced as the mean of those that have one."""
         keys = self._keys(env, enc)
-        names = [name] if any(name in self.cells[x] for x in keys) else self.probed
+        names = [name] if any(self._timed(x, name) for x in keys) else self.probed
         pts, extra = [], False
         for x in keys:
             vals = []
@@ -1251,7 +1266,7 @@ def flag_value(args, flag, default, kind=str):
 def pipeline_setup():
     """run_pipeline.py's GRID and tuning settings, and tune_hyperparams.py's."""
     pipe = read_constants(os.path.join(CODE_DIR, PIPELINE_FILE),
-                          {'GRID', 'TUNE_EVALS_PER_DIM', 'TUNER_ARGS'})
+                          {'GRID', 'TUNE_EVALS_PER_DIM', 'TUNER_ARGS', 'TUNE_N'})
     found = 'GRID' in pipe
     grid = dict(DEFAULT_GRID)
     grid.update(pipe.get('GRID', {}))
@@ -1263,6 +1278,7 @@ def pipeline_setup():
     if tuner:
         tune = dict(
             per_dim=pipe.get('TUNE_EVALS_PER_DIM'),
+            n=pipe.get('TUNE_N'),                   # None (or an older file): every cell
             outer=flag_value(targs, '--outer-budget', tuner.get('OUTER_BUDGET', 40), int),
             k_inner=flag_value(targs, '--k-inner', tuner.get('K_INNER', 4), int),
             optimizer=flag_value(targs, '--inner-optimizer',
@@ -1361,12 +1377,15 @@ class Plan:
 
 
 def tuning_cost(model, plan, tune, k_env):
-    """(core-hours, wall lower bound) of run_pipeline.py's tuning stage: per cell,
-    (outer + 2) x K inner runs of the tuner's inner optimizer, at TUNE_EVALS_PER_DIM x d or,
-    when that is None, at the cell's grid budget."""
+    """(core-hours, wall lower bound) of run_pipeline.py's tuning stage: per tuned cell
+    (those with TUNE_N neurons per observation, or all), (outer + 2) x K inner runs of the
+    tuner's inner optimizer, at TUNE_EVALS_PER_DIM x d or, when that is None, at the
+    cell's grid budget."""
     runs = (tune['outer'] + 2) * tune['k_inner']
     core = longest = 0.0
     for env, enc, hidden, n, d in plan.cells:
+        if tune.get('n') is not None and int(n) != int(tune['n']):
+            continue
         kt = float(tune['per_dim']) if tune['per_dim'] is not None else k_env[env]
         b = clip_budget(kt, d, plan.grid)
         T, _ = model.train_seconds(env, enc, d, tune['optimizer'], b / float(d))
@@ -1410,9 +1429,13 @@ def print_scores(results):
         rows_meta.setdefault(ck, {}).setdefault(t['optimizer'], set()).add(t['kind'])
     print("=== SCORES: seeds whose recommendation passes / seeds scored (median raw reward "
           "on the report block) ===")
+    pending = []
     for env in ENVIRONMENTS:
         for ck in sorted((x for x in tab if x[0] == env), key=lambda x: (x[1], x[4])):
             levels = sorted({L for o in tab[ck].values() for L in o})
+            if not levels:                  # its runs have started, none has a score yet
+                pending.append(ck)
+                continue
             print("\n%s | %s | hidden %s, %d per observation | d=%d | pass: raw >= %g"
                   % (env, ck[1], ck[2], ck[3], ck[4], THRESHOLD[env]))
             print("  %-13s" % 'optimizer' + "".join("%11s" % ("%gxd" % L) for L in levels)
@@ -1437,9 +1460,13 @@ def print_scores(results):
                 ms = "%13.1f" % (1000 * T / (levels[-1] * ck[4])) if T else "%13s" % "-"
                 note = "  (one run per budget)" if 'per-level' in rows_meta[ck][name] else ""
                 print("  %-13s" % name + "".join(cells_) + ms + note)
+    if pending:
+        print("\nstarted, no score yet: %s" % ", ".join(
+            "%s %s %s/%d" % (ck[0], ck[1], ck[2], ck[3]) for ck in pending))
     print("\n=== BEST OF THE SIX: median raw of the best optimizer at each budget ===")
     for env in ENVIRONMENTS:
-        cks = sorted((x for x in tab if x[0] == env), key=lambda x: (x[1], x[4]))
+        cks = sorted((x for x in tab if x[0] == env and any(tab[x].values())),
+                     key=lambda x: (x[1], x[4]))
         if not cks:
             continue
         levels = sorted({L for ck in cks for o in tab[ck].values() for L in o})
@@ -1472,6 +1499,12 @@ def cmd_summary(hours, cores, grid_optimizers, k_max=None):
 
     model = CostModel(results)
     grid, found, tune = pipeline_setup()
+    missing = model.ready(grid['environments'], grid['encodings'])
+    if missing:
+        print("\n=== GRID TIME: not yet. It needs a measured time from every environment, and "
+              "%s has none: no run there has reached its first level. Ask again later. ==="
+              % " and ".join(sorted({e for e, c in missing})))
+        return
     names = list(OPTIMIZERS)
     if grid_optimizers:
         if str(grid_optimizers).isdigit():
@@ -1503,10 +1536,14 @@ def cmd_summary(hours, cores, grid_optimizers, k_max=None):
 
     if tune:
         per = tune['per_dim']
+        n_tuned = sum(1 for c in plan.cells
+                      if tune.get('n') is None or int(c[3]) == int(tune['n']))
         print("tuning >= = %s's tuning stage before the grid, at least: (%d + 2) x %d %s runs "
-              "per cell at %s (TUNE_EVALS_PER_DIM = %s)"
+              "per tuned cell at %s (TUNE_EVALS_PER_DIM = %s), %d of the %d cells tuned%s"
               % (PIPELINE_FILE, tune['outer'], tune['k_inner'], tune['optimizer'],
-                 "%g x d" % per if per is not None else "its grid budget", per))
+                 "%g x d" % per if per is not None else "its grid budget", per, n_tuned,
+                 len(plan.cells), "" if tune.get('n') is None
+                 else " (TUNE_N = %d)" % int(tune['n'])))
     tune_col = (lambda k_env: fmt_secs(tuning_cost(model, plan, tune, k_env)[1])) if tune \
         else (lambda k_env: '-')
 
