@@ -96,7 +96,7 @@ MC_ACTIONS    = ('left', 'none', 'right')
 #                sample the whole box and step by differences, so they don't.
 # The defaults reproduce the runs made before these settings existed.
 PARAM_NOISY = True
-PARAM_SIGMA = None
+PARAM_SIGMA = 'range/6'
 
 
 # ---------- flatten / unflatten ----------
@@ -409,9 +409,9 @@ def make_parametrization(name, init, trial):
         param.set_mutation(sigma=sigma)   # before set_bounds, which checks 3 sigma fit
     param.set_bounds(W_LOW, W_HIGH)
     noisy = bool(PARAM_NOISY)
+    param.function.deterministic = False
     param.real_world = True
     param.neural = True    
-    param.function.deterministic = False
     param.random_state = np.random.RandomState(SEED + int(trial))
     info = dict(noisy=noisy, sigma=float(np.ravel(param.sigma.value)[0]),
                 sigma_rule=('nevergrad default' if PARAM_SIGMA is None
