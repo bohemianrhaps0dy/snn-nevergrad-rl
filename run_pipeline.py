@@ -60,11 +60,11 @@ GRID = dict(
     n_per_dim=[2, 4, 6, 10],
     trials=5,
     generator='regular',                  # poprate's spike generator, in tuning and grid
-    evals_per_dim=100,                    # grid budget = evals_per_dim x d, clipped to
+    evals_per_dim=40,                    # grid budget = evals_per_dim x d, clipped to
     budget_min=1000,                      # [budget_min, budget_max]; None = no bound
     budget_max=None,
 )
-TUNE_EVALS_PER_DIM = None   # the tuner's inner budget per weight (same clip). None = the
+TUNE_EVALS_PER_DIM = 20   # the tuner's inner budget per weight (same clip). None = the
                             # grid's budget, so tuning scores the grid's own search.
                             # 20 makes the tuning about 5x cheaper.
 TUNE_N = 4                  # tune only the cells with this many neurons per observation;
@@ -278,8 +278,9 @@ def preflight():
         problems.append("tune_hyperparams.py is older than the one this pipeline runs (the "
                         "Oct 27 version, whose inner runs go through optimize_snn's "
                         "train_weights)")
-    if not all(hasattr(T.optimize_snn, a) for a in ('train_weights', 'make_objective',
-                                                     'initial_point')):
+    import optimize_snn as osnn             # the tuner may import it under another name
+    if not all(hasattr(osnn, a) for a in ('train_weights', 'make_objective',
+                                          'initial_point')):
         problems.append("optimize_snn.py has no train_weights()/make_objective(): use the "
                         "Oct 27 version that tune_hyperparams.py needs")
     for name, flag in (('make_grid_settings.py', '--always-tuned'),
