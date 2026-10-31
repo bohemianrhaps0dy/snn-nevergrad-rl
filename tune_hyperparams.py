@@ -162,7 +162,7 @@ CELLS = [
 ]
 
 # --- outer loop -------------------------------------------------------------
-OUTER_BUDGET    = 40       # configurations to evaluate (space is 3 dims)
+OUTER_BUDGET    = 50       # configurations to evaluate (space is 3 dims)
 OUTER_OPTIMIZER = 'TBPSA'  # noise-aware; 'NGOpt' is a reasonable alternative
 OUTER_BATCH     = None     # configs proposed and scored at once. None = TBPSA's
                            # population (12 for 3 dims); other outer optimizers get
@@ -199,9 +199,9 @@ TRIAL_OFFSET        = 1_000     # inner run with seed s is trial TRIAL_OFFSET + 
 # --- search space bounds ----------------------------------------------------
 # w_scale, log-scaled. At the low end the network goes silent, at the high end
 # the outputs saturate into ties; +-20, +-40 and +-60 were tested in D5.
-W_SCALE_LO, W_SCALE_HI = 5.0, 100.0
-R_MAX_LO,   R_MAX_HI   = 50.0, 500.0  # log-scaled Hz
-R_MIN_FRAC_HI          = 0.5          # r_min = frac * r_max, so r_min < r_max
+W_SCALE_LO, W_SCALE_HI = 5.0, 60.0
+R_MAX_LO,   R_MAX_HI   = 50.0, 400.0  # log-scaled Hz
+R_MIN_FRAC_LO, R_MIN_FRAC_HI = 0.2, 0.8  # r_min >= 10 Hz even at r_max = 50
 
 # LATENCY BOUNDS (fix F4). The latency code needs its spike times spread over
 # several simulation steps: with dt = 1 ms, a range below about 1.5 ms puts every
@@ -211,7 +211,7 @@ R_MIN_FRAC_HI          = 0.5          # r_min = frac * r_max, so r_min < r_max
 # lat_window <= T_STEP_FIXED - 2 by construction, because ANNarchy drops spikes
 # scheduled past the end of the step without a warning.
 LAT_MIN_LO,  LAT_MIN_HI  = 1.0, 10.0
-LAT_SPAN_LO = 5.0
+LAT_SPAN_LO = 3.0
 LAT_SPAN_HI = T_STEP_FIXED - 2.0 - LAT_MIN_HI
 
 # --- cost estimate only (seconds per episode on the server, as in experiment_runner.py)
@@ -277,7 +277,7 @@ def build_space(encoding):
     full = dict(
         w_scale   =ng.p.Log(lower=W_SCALE_LO, upper=W_SCALE_HI),
         r_max     =ng.p.Log(lower=R_MAX_LO, upper=R_MAX_HI),
-        r_min_frac=ng.p.Scalar(lower=0.0, upper=R_MIN_FRAC_HI),
+        r_min_frac=ng.p.Scalar(lower=R_MIN_FRAC_LO, upper=R_MIN_FRAC_HI),
         lat_min   =ng.p.Scalar(lower=LAT_MIN_LO, upper=LAT_MIN_HI),
         lat_span  =ng.p.Scalar(lower=LAT_SPAN_LO, upper=LAT_SPAN_HI),
     )
