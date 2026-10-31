@@ -112,12 +112,12 @@ CELLS = [
 ]
 
 # --- outer loop -------------------------------------------------------------
-OUTER_BUDGET    = 50       # configurations to evaluate (space is 3 dims)
+OUTER_BUDGET    = 40       # configurations to evaluate (space is 3 dims)
 OUTER_OPTIMIZER = 'TBPSA'  # noise-aware; 'NGOpt' is a reasonable alternative
 
 # --- inner loop (cost driver) ----------------------------------------------
-INNER_OPTIMIZER      = 'RandomSearch'   # see the caveat in the module docstring
-INNER_BUDGET         = 300    # weight evaluations per inner run
+INNER_OPTIMIZER      = 'DE'   # see the caveat in the module docstring
+INNER_BUDGET         = 150    # weight evaluations per inner run
 # Episodes averaged per inner objective call. Every candidate of one inner run is
 # scored on the SAME episodes (common random numbers), so with 1 episode the whole
 # inner run would be tuned to a single start position. 10 matches EVAL_EPISODES
@@ -125,7 +125,7 @@ INNER_BUDGET         = 300    # weight evaluations per inner run
 # instead of this.
 INNER_EVAL_EPISODES  = 10
 K_INNER              = 4      # independent inner runs averaged to score a config
-TUNE_REPORT_EPISODES = 100     # report episodes per inner run
+TUNE_REPORT_EPISODES = 20     # report episodes per inner run
 INNER_SIGMA          = 0.3    # mutation step, in units of the [-1, 1] cube
 
 # The encoders' `graded` mode. evaluate() encodes through drive_encoder_fast(),
@@ -140,11 +140,9 @@ REPORT_SEED_GAP = 500_000     # keeps report episodes disjoint from training one
 # --- search space bounds ----------------------------------------------------
 # w_scale, log-scaled. At the low end the network goes silent, at the high end
 # the outputs saturate into ties; +-20, +-40 and +-60 were tested in D5.
-W_SCALE_LO, W_SCALE_HI = 10.0, 50.0
-R_MAX_HI           = 400.0  # log-scaled Hz
-R_MIN_LO, R_MIN_HI = 20.0, 150.0          
-R_SPAN_LO          = 50.0                 # Hz, at least 3 spike counts across a bin
-R_SPAN_HI          = R_MAX_HI - R_MIN_HI
+W_SCALE_LO, W_SCALE_HI = 5.0, 100.0
+R_MAX_LO,   R_MAX_HI   = 50.0, 500.0  # log-scaled Hz
+R_MIN_FRAC_HI          = 0.5          # r_min = frac * r_max, so r_min < r_max
 
 # LATENCY BOUNDS (fix F4). The latency code needs its spike times spread over
 # several simulation steps: with dt = 1 ms, a range below about 1.5 ms puts every
@@ -199,7 +197,7 @@ def active_params(encoding):
     """Which hyperparameters affect behaviour for this encoding."""
     p = ['w_scale']
     if encoding == 'poprate':
-        p += ['r_min', 'r_span']
+        p += ['r_max', 'r_min_frac']
     if encoding == 'poplatency':
         p += ['lat_min', 'lat_span']
     return p
@@ -209,8 +207,8 @@ def build_space(encoding):
     """Instrumentation over the active parameters for this encoding."""
     full = dict(
         w_scale   =ng.p.Log(lower=W_SCALE_LO, upper=W_SCALE_HI),
-        r_min     =ng.p.Log(lower=R_MIN_LO, upper=R_MIN_HI),
-        r_span    =ng.p.Scalar(lower=R_SPAN_LO, upper=R_SPAN_HI),
+        r_max     =ng.p.Log(lower=R_MAX_LO, upper=R_MAX_HI),
+        r_min_frac=ng.p.Scalar(lower=0.0, upper=R_MIN_FRAC_HI),
         lat_min   =ng.p.Scalar(lower=LAT_MIN_LO, upper=LAT_MIN_HI),
         lat_span  =ng.p.Scalar(lower=LAT_SPAN_LO, upper=LAT_SPAN_HI),
     )
@@ -230,11 +228,8 @@ def resolve(theta, encoding):
     receives a complete config.
     """
     g = DEFAULTS
-    if 'r_min' in theta:
-        r_min = float(theta['r_min'])
-        r_max = r_min + float(theta['r_span'])
-    else:
-        r_min, r_max = float(g['R_MIN']), float(g['R_MAX'])
+    r_max = float(theta.get('r_max', g['R_MAX']))
+    r_min = float(theta.get('r_min_frac', g['R_MIN'] / g['R_MAX'])) * r_max
     if 'lat_min' in theta:
         lat_min = float(theta['lat_min'])
         lat_window = lat_min + float(theta['lat_span'])
@@ -413,9 +408,10 @@ def _cell_tag(cell):
 def _fmt(cfg, keys):
     """One-line view of just the parameters this encoding actually uses."""
     out = ['w=%.1f' % cfg['w_scale']]
-    if 'r_min' in keys:
-        out.append('rmin=%.0f' % cfg['r_min'])
+    if 'r_max' in keys:
         out.append('rmax=%.0f' % cfg['r_max'])
+    if 'r_min_frac' in keys:
+        out.append('rmin=%.0f' % cfg['r_min'])
     if 'lat_min' in keys:
         out.append('latmin=%.1f' % cfg['lat_min'])
         out.append('latwin=%.1f' % cfg['lat_window'])
