@@ -7,10 +7,10 @@ parameters that every optimizer shares.
 
 TUNED (3 dimensions for every encoding):
 
-    w_scale       weight bound. Nevergrad searches in [-1, 1] and every
-                  projection is multiplied by the same w_scale before it reaches
-                  the network, so w_scale means exactly what W_LOW / W_HIGH mean
-                  in optimize_snn.py and --bound means in calibrate.py.
+    w_scale       weight bound: the inner run searches the grid's box
+                  [-w_scale, w_scale], so w_scale means exactly what W_LOW / W_HIGH
+                  mean in optimize_snn.py (what experiment_runner.py sets per cell
+                  from grid_settings.json) and --bound means in calibrate.py.
     r_max, r_min  rate bounds of the active bin (Hz)           -- poprate
     lat_min       latency of the active bin at r = 1 (ms)      -- poplatency
     lat_window    latency of the active bin at r = 0 (ms)      -- poplatency
@@ -28,66 +28,116 @@ FIXED, set by hand in the CELLS table below:
     generator     poprate spike generator, 'poisson' or 'regular'
     t_step        simulated ms per environment step -- pinned to 50.0
 
-Because topology, n_per_dim and generator are fixed, the ANNarchy network
-compiles exactly ONCE per cell. A tuned w_scale belongs to its cell: it does not
+Because topology, n_per_dim and generator are fixed, every worker compiles the
+cell's network exactly ONCE. A tuned w_scale belongs to its cell: it does not
 transfer to other topologies or n_per_dim values, so tune each cell the grid runs.
 
 ------------------------------------------------------------------------------
-WHY THE WEIGHTS ARE SEARCHED IN A [-1, 1] CUBE
+THE INNER RUN IS THE GRID'S
 ------------------------------------------------------------------------------
 
-The inner optimizer searches a fixed [-1, 1] cube and w_scale multiplies every
-weight on its way into the network. With both bounds set, DE and RandomSearch
-draw their first candidates uniformly over the whole box, so for them this is
-the same search as optimize_snn.py's raw [-W_HIGH, W_HIGH]. Mutation-based
-optimizers (OnePlusOne, CMA, TBPSA) take steps of INNER_SIGMA in cube units here,
-i.e. INNER_SIGMA * w_scale in weight units, which is NOT what they do in
-optimize_snn.py (an absolute step of 1). Keep that in mind if you tune with one.
+Every inner run goes through optimize_snn.py's own code: make_objective() for the
+training objective, initial_point() for the starting weights, and train_weights()
+for make_parametrization() plus the ask/tell loop. So a config is scored on the
+search the grid runs: the raw box [-w_scale, w_scale] with PARAM_SIGMA's step
+(Nevergrad's 1.0 by default) and PARAM_NOISY's declaration, INNER_EVAL_EPISODES
+training episodes per evaluation, and the optimizer's own recommendation as the
+final network (N1 is a grid diagnostic and is not used here). Three differences,
+all deliberate:
+
+  - Training episodes are seeded (make_objective(train_seed=seed)): the starts are
+    fresh at every evaluation, as in the grid, but inner run k of every config sees
+    the same sequence, so configs are compared on the same draws.
+  - The recommendation is scored on TUNE_REPORT_EPISODES seeded episodes, kept clear
+    of the training episodes and of the grid's report blocks.
+  - Inner run k uses trial TRIAL_OFFSET + seed in optimize_snn, so its starting
+    weights and optimizer seed never coincide with a grid trial's.
+
+Budget: INNER_EVALS_PER_DIM x d evaluations (100 x d, no upper cap), the grid's
+per-weight formula. --inner-budget N replaces it with a fixed N for every cell.
+
+------------------------------------------------------------------------------
+IS 100 x d WASTED? (--budget-check)
+------------------------------------------------------------------------------
+
+Every inner run also reads its recommendation after CHECKPOINTS_PER_DIM x d
+evaluations (20 and 50 x d by default) and scores it on the same report episodes
+as the final one, so each run shows what the later evaluations added; the results
+keep these under 'checkpoints'. --budget-check runs only the current settings of
+each cell, K runs in parallel, prints that table with the paired difference
+between the final recommendation and each checkpoint, and stops. If the 20 x d
+and 100 x d rows match on a cell, the extra budget is wasted there. The answer
+belongs to the inner optimizer: add --inner-optimizer to ask it of another one.
 
 ------------------------------------------------------------------------------
 ONE CAVEAT BEFORE THE OUTPUT GOES IN THE THESIS
 ------------------------------------------------------------------------------
 
-Tuning uses ONE inner optimizer (--inner-optimizer, default DE). Whatever it
-finds is "the encoding that suits DE". If those settings then become the fixed
-settings for the whole optimizer grid, DE gets a home-field advantage in the
-comparison that is your actual contribution. Tuning with an optimizer that is
-not a contestant in the headline claim avoids that.
+Tuning uses ONE inner optimizer (--inner-optimizer, default RandomSearch).
+Whatever it finds is "the encoding that suits RandomSearch". RandomSearch adapts
+nothing, so it gives no grid contestant a home-field advantage, but it measures
+the best of many random networks, not what the grid's optimizers reach. Confirm
+the adopted settings with a short run of the grid's optimizers (tuned vs current,
+5 seeds) before the full grid.
 
-The inner run is also much shorter than a grid run (INNER_BUDGET evaluations
-against the grid's 1,320 to 2,000), so treat the winner as a shortlist and
-confirm it with a 5-seed calibrate.py test before adopting it.
+------------------------------------------------------------------------------
+PARALLEL RUNS
+------------------------------------------------------------------------------
+
+The outer optimizer proposes OUTER_BATCH configs at a time (TBPSA's population,
+12 for 3 dimensions, by default), and every one of their K inner runs runs in its
+own worker process: a batch of 12 configs at K = 4 is 48 inner runs at once. Each
+worker is single-threaded, compiles the cell's network once into its own folder
+(deleted at the end unless --keep-builds), and receives its config with every
+task, because spawn workers never see module changes made in the main process.
+Only the main process writes the checkpoint, after each complete batch, so
+--resume continues from the last finished batch. It continues only a checkpoint
+made with the same scoring settings (inner optimizer, budget, checkpoints,
+episodes, K): one written by an earlier version of this tuner is never resumed,
+because its scores came from a different inner run. If one cell's batches leave
+cores idle, run cells side by side as separate processes (--env / --encoding).
 
 ------------------------------------------------------------------------------
 USAGE
 ------------------------------------------------------------------------------
 
-    python tune_hyperparams.py --dry-run     # space + cost estimate only
-    python tune_hyperparams.py --quick       # minutes, plumbing check
+    python tune_hyperparams.py --dry-run         # budgets, batches, cost estimate only
+    python tune_hyperparams.py --quick           # minutes, plumbing check
+    python tune_hyperparams.py --budget-check --env acrobot   # is 100 x d wasted?
     python tune_hyperparams.py --env mountaincar --encoding poprate --decoding vote
     python tune_hyperparams.py --env mountaincar --generator poisson
-    python tune_hyperparams.py --resume      # continue from checkpoint
+    python tune_hyperparams.py --resume          # continue from checkpoint
+    python tune_hyperparams.py --workers 1       # serial, for debugging
+    python tune_hyperparams.py --out-dir tuning_100d   # keep earlier results apart
 
-Needs calibrate.py next to it: the report episodes go through
-calibrate.scored_episode(), which returns evaluate()'s exact fitness and also
-counts the steps whose output was silent or tied.
+Results overwrite tuning/result-<cell>.json, the files make_grid_settings.py reads
+by default; use --out-dir (and its --results glob) to keep an earlier run's.
 """
 
-import argparse
-import json
 import os
-import time
+
+# One thread per process, set before anything imports ANNarchy; spawn workers re-import
+# this file, so they get it too (as in experiment_runner.py).
+for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+           'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+    os.environ.setdefault(_v, '1')
+
+import argparse
 import contextlib
+import glob
+import json
+import math
+import shutil
+import time
 
 import numpy as np
 import nevergrad as ng
-import gymnasium as gym
 from nevergrad.optimization import optimizerlib as O
 
 import snn_feedforward as snn
-from snn_feedforward import build_network, evaluate
+import optimize_snn
+from snn_feedforward import build_network, weight_shapes
 from optimize_snn import n_params, flat_to_weights, W_HIGH
-from calibrate import scored_episode
 
 
 # ============================================================================
@@ -114,28 +164,37 @@ CELLS = [
 # --- outer loop -------------------------------------------------------------
 OUTER_BUDGET    = 40       # configurations to evaluate (space is 3 dims)
 OUTER_OPTIMIZER = 'TBPSA'  # noise-aware; 'NGOpt' is a reasonable alternative
+OUTER_BATCH     = None     # configs proposed and scored at once. None = TBPSA's
+                           # population (12 for 3 dims); other outer optimizers get
+                           # workers // K_INNER. A bigger batch fills more cores but
+                           # leaves TBPSA fewer generations (40 configs at 48 = one).
 
 # --- inner loop (cost driver) ----------------------------------------------
-INNER_OPTIMIZER      = 'DE'   # see the caveat in the module docstring
-INNER_BUDGET         = 150    # weight evaluations per inner run
-# Episodes averaged per inner objective call. Every candidate of one inner run is
-# scored on the SAME episodes (common random numbers), so with 1 episode the whole
-# inner run would be tuned to a single start position. 10 matches EVAL_EPISODES
-# in optimize_snn.py. If the run is too slow, lower OUTER_BUDGET or K_INNER
-# instead of this.
+INNER_OPTIMIZER      = 'RandomSearch'   # see the caveat in the module docstring
+INNER_EVALS_PER_DIM  = 100      # budget = 100 x d weight evaluations (d = genome size),
+INNER_BUDGET_MIN     = 1000     # clipped to [MIN, MAX] like the grid's formula;
+INNER_BUDGET_MAX     = None     # None = no upper cap
+CHECKPOINTS_PER_DIM  = (20, 50)  # also score the recommendation after 20 x d and
+                                 # 50 x d evaluations (see --budget-check)
+# Training episodes per evaluation, as EVAL_EPISODES in optimize_snn.py. They are
+# seeded and fresh at every evaluation (make_objective(train_seed=...)), so an inner
+# run trains on as many different starts as a grid run does. If the run is too slow,
+# lower OUTER_BUDGET or K_INNER instead of this.
 INNER_EVAL_EPISODES  = 10
 K_INNER              = 4      # independent inner runs averaged to score a config
-TUNE_REPORT_EPISODES = 20     # report episodes per inner run
-INNER_SIGMA          = 0.3    # mutation step, in units of the [-1, 1] cube
+TUNE_REPORT_EPISODES = 20     # report episodes per inner run (and per checkpoint)
 
 # The encoders' `graded` mode. evaluate() encodes through drive_encoder_fast(),
 # which implements 'residual' only, so it is pinned and recorded in the results.
 GRADED = 'residual'
 
 # --- seeding ----------------------------------------------------------------
-SEED            = 0
-HOLDOUT_OFFSET  = 10_000      # held-out seed block for the honest re-score
-REPORT_SEED_GAP = 500_000     # keeps report episodes disjoint from training ones
+SEED                = 0
+HOLDOUT_OFFSET      = 10_000    # held-out seed block for the honest re-score
+BUDGET_CHECK_OFFSET = 20_000    # seed block of --budget-check
+REPORT_SEED_GAP     = 500_000   # keeps report episodes disjoint from training ones
+TRIAL_OFFSET        = 1_000     # inner run with seed s is trial TRIAL_OFFSET + s in
+                                # optimize_snn (starting weights, optimizer's seed)
 
 # --- search space bounds ----------------------------------------------------
 # w_scale, log-scaled. At the low end the network goes silent, at the high end
@@ -155,8 +214,12 @@ LAT_MIN_LO,  LAT_MIN_HI  = 1.0, 10.0
 LAT_SPAN_LO = 5.0
 LAT_SPAN_HI = T_STEP_FIXED - 2.0 - LAT_MIN_HI
 
+# --- cost estimate only (seconds per episode on the server, as in experiment_runner.py)
+EP_SECONDS = {'mountaincar': 0.018, 'acrobot': 0.065}
+
 # --- housekeeping -----------------------------------------------------------
 OUT_DIR = 'tuning'
+BUILD_DIR = 'annarchy'      # worker w compiles into BUILD_DIR/tune-<cell>-w<pid>
 
 
 # ============================================================================
@@ -164,9 +227,11 @@ OUT_DIR = 'tuning'
 # ============================================================================
 # evaluate() encodes through drive_encoder_fast(), which reads R_MIN, R_MAX,
 # LAT_MIN, LAT_WINDOW and T_STEP from snn_feedforward's module globals every
-# time it runs, and reads n_per_dim from the compiled input layer. So setting the
-# module globals is enough; the encoder functions with frozen default arguments
-# (encode_poprate, encode_poplatency) are not on that path.
+# time it runs, and reads n_per_dim from the compiled input layer. The inner
+# run's box comes from optimize_snn's W_LOW / W_HIGH, which make_parametrization()
+# and initial_point() read when they run. So setting the module globals is
+# enough -- in the process that runs the inner run, which is why every task
+# carries its config to its worker.
 
 _TUNED_GLOBALS = ('T_STEP', 'R_MAX', 'R_MIN', 'LAT_WINDOW', 'LAT_MIN')
 
@@ -175,18 +240,22 @@ DEFAULTS = {name: getattr(snn, name) for name in _TUNED_GLOBALS}
 
 @contextlib.contextmanager
 def snn_config(cfg):
-    """Apply a resolved config to snn_feedforward, then restore."""
+    """Apply a resolved config to snn_feedforward and optimize_snn, then restore."""
     saved = {name: getattr(snn, name) for name in _TUNED_GLOBALS}
+    saved_box = (optimize_snn.W_LOW, optimize_snn.W_HIGH)
     try:
         snn.T_STEP     = float(T_STEP_FIXED)
         snn.R_MAX      = float(cfg['r_max'])
         snn.R_MIN      = float(cfg['r_min'])
         snn.LAT_WINDOW = float(cfg['lat_window'])
         snn.LAT_MIN    = float(cfg['lat_min'])
+        w = float(cfg['w_scale'])
+        optimize_snn.W_LOW, optimize_snn.W_HIGH = -w, w
         yield
     finally:
         for name, value in saved.items():
             setattr(snn, name, value)
+        optimize_snn.W_LOW, optimize_snn.W_HIGH = saved_box
 
 
 # ============================================================================
@@ -260,124 +329,179 @@ def baseline_config():
 
 
 # ============================================================================
+# BUDGET
+# ============================================================================
+
+def cell_dim(cell):
+    """Genome size d of a cell, without building its network."""
+    return n_params(weight_shapes(cell['environment'], cell['hidden_sizes'],
+                                  cell['encoding'], cell['n_per_dim']))
+
+
+def inner_budget(dim, args):
+    """Weight evaluations per inner run: --inner-budget if given, otherwise
+    --evals-per-dim x d clipped to [INNER_BUDGET_MIN, INNER_BUDGET_MAX]."""
+    if args.inner_budget is not None:
+        return int(args.inner_budget)
+    budget = max(int(round(args.evals_per_dim * dim)), INNER_BUDGET_MIN)
+    if INNER_BUDGET_MAX is not None:
+        budget = min(budget, int(INNER_BUDGET_MAX))
+    return budget
+
+
+def checkpoint_counts(dim, budget, per_dim):
+    """Evaluation counts at which to read the recommendation: per_dim x d, below the
+    budget (the final recommendation is always scored)."""
+    counts = sorted({int(round(p * dim)) for p in per_dim})
+    return [c for c in counts if 0 < c < budget]
+
+
+# ============================================================================
 # INNER RUN AND CONFIG SCORING
 # ============================================================================
 
-_SIGMA_CHECKED = []
+def _report(net, flat, n_episodes, episode_seed):
+    """optimize_snn.report_fitness() of one flat weight vector, the fields kept."""
+    r = optimize_snn.report_fitness(net, flat_to_weights(flat, net['shapes']),
+                                    n_episodes, episode_seed)
+    return dict(mean=r['mean'], raw=r['reward_mean'], goal_share=r['goal_share'],
+                random_actions=r['random_actions'], silent=r['silent'],
+                tied=r['tied'])
 
 
-def _check_sigma(param):
-    """Confirm sigma actually took, once per run.
-
-    Silencing the bounds warning by reordering is only correct if the sigma we
-    asked for is the sigma the parameter ends up with. If set_mutation had no
-    effect, the warning would be gone while the underlying problem -- mutations
-    spanning the whole cube and bouncing off the walls -- would remain. So read
-    it back rather than assuming.
-    """
-    if _SIGMA_CHECKED:
-        return
-    try:
-        sigma = float(np.asarray(param.sigma.value).ravel()[0])
-    except Exception as exc:
-        print("[sigma] could not read back sigma (%s)" % exc)
-        _SIGMA_CHECKED.append(None)
-        return
-    ratio = 2.0 / sigma
-    print("[sigma] requested=%.3f actual=%.3f -> bounds are %.1f sigma apart%s"
-          % (INNER_SIGMA, sigma, ratio,
-             "" if ratio >= 3.0 else "   <-- still below nevergrad's target of 3"))
-    _SIGMA_CHECKED.append(sigma)
-
-
-def report(net, weights, n_episodes, episode_seed):
-    """report_fitness() from optimize_snn.py, plus the decoder's random actions.
-
-    Same episode seeds (episode_seed*1000 + k) and the same random draws as
-    report_fitness(), because calibrate.scored_episode() returns evaluate()'s
-    exact fitness. A random action is a silent window, or a tie under vote (a
-    first-spike tie goes to the lowest index, so it is not random).
-    """
-    base = int(episode_seed) * 1000
-    rows = [scored_episode(snn, gym, net, weights, base + k)
-            for k in range(int(n_episodes))]
-    raw = np.array([r[0] for r in rows], dtype=float)
-    shaped = np.array([r[1] for r in rows], dtype=float)
-    silent = np.array([r[2] / r[4] for r in rows], dtype=float)
-    tied = np.array([r[3] / r[4] for r in rows], dtype=float)
-    rand = silent + tied if net['decoding'] == 'vote' else silent
-    return dict(mean=float(shaped.mean()), raw=float(raw.mean()),
-                random_actions=float(rand.mean()), silent=float(silent.mean()),
-                tied=float(tied.mean()))
-
-
-def run_inner(net, cfg, seed, inner_optimizer, inner_budget):
-    """One weight optimization under a fixed encoding config.
-
-    The optimizer searches a normalized [-1, 1] cube; every weight is then
-    multiplied by cfg['w_scale'] on the way into the network. Returns the report
-    of the recommended weights (shaped mean, raw mean, random-action shares).
+def run_inner(net, seed, inner_optimizer, budget, checkpoints, eval_episodes,
+              report_episodes):
+    """One weight optimization under the config snn_config() has applied, through
+    optimize_snn's own inner run. Returns the report of the recommended weights
+    (shaped mean, raw mean, goal share, random-action shares) and, under
+    'checkpoints', the same report of the recommendation after each evaluation count
+    in `checkpoints`.
 
     Seeding, kept disjoint on purpose:
-      training episodes use seeds  seed*1000 + j
-      report episodes   use seeds  (seed + REPORT_SEED_GAP)*1000 + k
+      training episodes  optimize_snn.training_seed(seed, i, j, ...), 10**12 and up,
+                         fresh at every evaluation i
+      report episodes    (seed + REPORT_SEED_GAP)*1000 + k, the same block for the
+                         final recommendation and every checkpoint (so they pair)
+      decoder draws      numpy's global generator, seeded with `seed` here
+      starting weights,  trial TRIAL_OFFSET + seed in optimize_snn
+      optimizer's seed
     so the reported score is never measured on an episode the inner loop trained
-    against. Without the gap, the report would reuse exactly the training
-    block and the optimism gap would be invisible.
+    against, and the optimism gap stays visible.
     """
     shapes = net['shapes']
-    dim = n_params(shapes)
-    scale = float(cfg['w_scale'])
-
-    rng = np.random.default_rng(seed)
-    init = rng.uniform(-1.0, 1.0, size=dim)
-
-    # ORDER MATTERS. ng.p.Array(init=...) starts at sigma=1.0, and set_bounds
-    # runs nevergrad's "at least 3 sigma between bounds" check immediately, at
-    # whatever sigma is set at that moment. Bounding first and mutating second
-    # checks 2.0/1.0 = 2.0 sigma and warns; setting sigma first checks
-    # 2.0/0.3 = 6.7 sigma and does not.
-    param = ng.p.Array(init=init).set_mutation(sigma=INNER_SIGMA)
-    param.set_bounds(-1.0, 1.0)
-    _check_sigma(param)
-    param.random_state = np.random.RandomState(seed)   # pin the inner sampler
-    np.random.seed(seed)                               # pin the decoder's draws
-
-    if inner_optimizer == 'NgIohTuned':
-        param.real_world = True
-        param.neural = True
-        param.function.deterministic = False
-
-    opt_cls = ng.optimizers.registry[inner_optimizer]
-    optimizer = opt_cls(parametrization=param, budget=int(inner_budget))
-
-    train_seeds = [seed * 1000 + j for j in range(INNER_EVAL_EPISODES)]
-
-    def objective(flat):
-        weights = flat_to_weights(np.asarray(flat) * scale, shapes)
-        # common random numbers within this inner run: every candidate is judged
-        # on the same episodes, so differences are signal rather than luck
-        vals = [evaluate(net, weights, episode_seed=s) for s in train_seeds]
-        return -float(np.mean(vals))
-
-    rec = optimizer.minimize(objective)
-    best = flat_to_weights(np.asarray(rec.value) * scale, shapes)
-    return report(net, best, TUNE_REPORT_EPISODES, seed + REPORT_SEED_GAP)
+    trial = TRIAL_OFFSET + int(seed)
+    np.random.seed(int(seed))                          # pin the decoder's draws
+    objective = optimize_snn.make_objective(net, shapes, int(eval_episodes),
+                                            train_seed=int(seed))
+    init = optimize_snn.initial_point(n_params(shapes), trial)
+    run = optimize_snn.train_weights(inner_optimizer, init, trial, int(budget),
+                                     objective, checkpoints=checkpoints)
+    report_seed = int(seed) + REPORT_SEED_GAP
+    out = _report(net, run['rec'], report_episodes, report_seed)
+    out['checkpoints'] = {str(c): _report(net, x, report_episodes, report_seed)
+                          for c, (x, _) in sorted(run['checkpoints'].items())}
+    out.update(evaluations=run['evaluations'], param=run['param'],
+               sub_optim=run['sub_optim'])
+    return out
 
 
-def score_config(net, cfg, base_seed, K, inner_optimizer, inner_budget):
-    """Mean final quality over K independent inner runs under this config."""
+# ---------- workers: one compiled network per process ----------
+_WORKER = {}
+
+
+def _build(cell, compile_dir):
+    """Compile the cell's network and check that the report scores what evaluate()
+    scores."""
+    with snn_config(baseline_config()):
+        net = build_network(cell['environment'], cell['hidden_sizes'],
+                            cell['encoding'], cell['decoding'], compile_dir,
+                            n_per_dim=cell['n_per_dim'],
+                            spike_generator=cell.get('generator'))
+        n_obs = int(net['cfg']['n_entrada'])
+        if net['encoder'].size != n_obs * cell['n_per_dim']:
+            raise RuntimeError('asked for %d neurons per observation, the network has %d'
+                               % (cell['n_per_dim'], net['encoder'].size // n_obs))
+        optimize_snn.check_scoring_loop(net, net['shapes'])
+    return net
+
+
+def _worker_init(cell, build_root):
+    """Once per worker process: compile this cell's network into the worker's own
+    folder."""
+    folder = os.path.join(build_root, "tune-%s-w%d" % (_cell_tag(cell), os.getpid()))
+    _WORKER['net'] = _build(cell, folder)
+
+
+def _task(job):
+    """WORKER: one inner run. The config travels with the task: a spawn worker
+    starts from the modules as imported, not as the main process left them."""
+    cfg, seed, inner_optimizer, budget, checkpoints, eval_episodes, report_episodes = job
     with snn_config(cfg):
-        reps = [run_inner(net, cfg, base_seed + k, inner_optimizer, int(inner_budget))
-                for k in range(int(K))]
-    vals = np.array([r['mean'] for r in reps], dtype=float)
-    return dict(mean=float(vals.mean()),
-                std=float(vals.std(ddof=1)) if K > 1 else 0.0,
-                vals=vals.tolist(),
-                raw=float(np.mean([r['raw'] for r in reps])),
-                random_actions=float(np.mean([r['random_actions'] for r in reps])),
-                silent=float(np.mean([r['silent'] for r in reps])),
-                tied=float(np.mean([r['tied'] for r in reps])))
+        return run_inner(_WORKER['net'], seed, inner_optimizer, budget, checkpoints,
+                         eval_episodes, report_episodes)
+
+
+class Runner:
+    """Runs inner runs on `workers` spawn processes (one network each), or in this
+    process when workers is 1. map() returns the results in job order."""
+
+    def __init__(self, cell, workers, build_root=BUILD_DIR):
+        self.cell, self.workers, self.build_root = cell, int(workers), build_root
+        self.pool = None
+        if self.workers <= 1:
+            _worker_init(cell, build_root)
+        else:
+            import concurrent.futures as cf
+            import multiprocessing as mp
+            self.pool = cf.ProcessPoolExecutor(
+                max_workers=self.workers, mp_context=mp.get_context('spawn'),
+                initializer=_worker_init, initargs=(cell, build_root))
+
+    def map(self, jobs):
+        if self.pool is None:
+            return [_task(j) for j in jobs]
+        futures = [self.pool.submit(_task, j) for j in jobs]
+        return [f.result() for f in futures]
+
+    def close(self, keep_builds=False):
+        if self.pool is not None:
+            self.pool.shutdown(wait=True)
+        if not keep_builds:
+            pattern = os.path.join(self.build_root,
+                                   "tune-%s-w*" % _cell_tag(self.cell))
+            for folder in glob.glob(pattern):
+                shutil.rmtree(folder, ignore_errors=True)
+
+
+def _aggregate(reps):
+    """Mean final quality over K inner runs, and the same for every checkpoint."""
+    def block(rows):
+        vals = np.array([r['mean'] for r in rows], dtype=float)
+        raws = np.array([r['raw'] for r in rows], dtype=float)
+        return dict(mean=float(vals.mean()),
+                    std=float(vals.std(ddof=1)) if len(rows) > 1 else 0.0,
+                    vals=vals.tolist(),
+                    raw=float(raws.mean()), raw_vals=raws.tolist(),
+                    goal_share=float(np.mean([r['goal_share'] for r in rows])),
+                    random_actions=float(np.mean([r['random_actions'] for r in rows])),
+                    silent=float(np.mean([r['silent'] for r in rows])),
+                    tied=float(np.mean([r['tied'] for r in rows])))
+    out = block(reps)
+    out['checkpoints'] = {c: block([r['checkpoints'][c] for r in reps])
+                          for c in reps[0]['checkpoints']}
+    out.update(param=reps[0]['param'], sub_optim=reps[0]['sub_optim'])
+    return out
+
+
+def score_configs(runner, cfgs, base_seed, args, budget, checkpoints):
+    """Score every config in cfgs on K inner runs (seeds base_seed + k), all of them at
+    once. Returns one summary per config, in order."""
+    K = int(args.k_inner)
+    jobs = [(cfg, base_seed + k, args.inner_optimizer, int(budget), list(checkpoints),
+             int(args.eval_episodes), int(args.report_episodes))
+            for cfg in cfgs for k in range(K)]
+    reps = runner.map(jobs)
+    return [_aggregate(reps[i * K:(i + 1) * K]) for i in range(len(cfgs))]
 
 
 # ============================================================================
@@ -418,137 +542,222 @@ def _fmt(cfg, keys):
     return ' '.join(out)
 
 
+def _ck_label(count, dim):
+    """'20d' for a whole number of evaluations per weight, else the count itself."""
+    per = count / float(dim)
+    if per >= 1 and abs(per - round(per)) < 0.05 * per:
+        return "%dd" % int(round(per))
+    return "%d evals" % count
+
+
+def _fmt_ck(sc, checkpoints, dim):
+    """Raw reward of the recommendation at each checkpoint: 'raw@20d -195.0/@50d -190.0'."""
+    parts = ["@%s %.1f" % (_ck_label(c, dim), sc['checkpoints'][str(c)]['raw'])
+             for c in checkpoints]
+    return ("| raw" + "/".join(parts)) if parts else ""
+
+
+def _fmt_secs(s):
+    s = int(s)
+    if s < 3600:
+        return "%dm %ds" % (s // 60, s % 60)
+    return "%dh %dm" % (s // 3600, (s % 3600) // 60)
+
+
+# ============================================================================
+# OUTER OPTIMIZER AND BATCHES
+# ============================================================================
+
+def default_batch(encoding, outer_optimizer, workers, K):
+    """OUTER_BATCH when it is None: TBPSA's population for this space, or
+    workers // K for any other outer optimizer."""
+    if OUTER_BATCH is not None:
+        return int(OUTER_BATCH)
+    if outer_optimizer == 'TBPSA':
+        probe = O.ParametrizedTBPSA(naive=True)(parametrization=build_space(encoding),
+                                                budget=1)
+        return int(probe.popsize.llambda)
+    return max(1, int(workers) // int(K))
+
+
+def make_outer(space, outer_optimizer, budget, batch):
+    """The outer optimizer, proposing `batch` configs at a time. Its sampler is seeded,
+    so a rerun proposes the same configs (a resumed run continues the pickled state)."""
+    space.random_state = np.random.RandomState(SEED)
+    if outer_optimizer == 'TBPSA':
+        return O.ParametrizedTBPSA(naive=True)(parametrization=space, budget=int(budget),
+                                               num_workers=int(batch))
+    return ng.optimizers.registry[outer_optimizer](parametrization=space,
+                                                   budget=int(budget),
+                                                   num_workers=int(batch))
+
+
+def _cpus():
+    return os.cpu_count() or 1
+
+
+def _run_key(args, budget, checkpoints):
+    """What has to match for --resume to continue a checkpoint: everything that changes
+    how a config is scored. Checkpoints written before this tuner used optimize_snn's
+    inner run have no key, so they are never resumed."""
+    return dict(inner_run='optimize_snn.train_weights', inner_optimizer=args.inner_optimizer,
+                inner_budget=int(budget), checkpoints=[int(c) for c in checkpoints],
+                eval_episodes=int(args.eval_episodes), k_inner=int(args.k_inner),
+                report_episodes=int(args.report_episodes),
+                outer_optimizer=args.outer_optimizer, seed=SEED,
+                trial_offset=TRIAL_OFFSET)
+
+
 # ============================================================================
 # THE TUNING RUN
 # ============================================================================
 
 def tune(cell, args):
     tag = _cell_tag(cell)
-    os.makedirs(OUT_DIR, exist_ok=True)
-    ckpt_json = os.path.join(OUT_DIR, "tune-%s.json" % tag)
-    ckpt_opt = os.path.join(OUT_DIR, "tune-%s.opt.pkl" % tag)
+    out_dir = args.out_dir
+    os.makedirs(out_dir, exist_ok=True)
+    ckpt_json = os.path.join(out_dir, "tune-%s.json" % tag)
+    ckpt_opt = os.path.join(out_dir, "tune-%s.opt.pkl" % tag)
 
     keys = active_params(cell['encoding'])
     space = build_space(cell['encoding'])
-
-    # topology, n_per_dim and generator are fixed for this cell, so this is the
-    # ONLY compile the whole tuning run performs
-    with snn_config(baseline_config()):
-        t0 = time.time()
-        net = build_network(cell['environment'], cell['hidden_sizes'],
-                            cell['encoding'], cell['decoding'], "annarchy/tune-" + tag,
-                            n_per_dim=cell['n_per_dim'],
-                            spike_generator=cell.get('generator'))
-    dim = n_params(net['shapes'])
-    n_obs = int(net['cfg']['n_entrada'])
-    if net['encoder'].size != n_obs * cell['n_per_dim']:
-        raise RuntimeError('asked for %d neurons per observation, the network has %d'
-                           % (cell['n_per_dim'], net['encoder'].size // n_obs))
+    dim = cell_dim(cell)
+    budget = inner_budget(dim, args)
+    checkpoints = checkpoint_counts(dim, budget, args.checkpoints)
+    K = int(args.k_inner)
+    batch = args.batch or default_batch(cell['encoding'], args.outer_optimizer,
+                                        args.workers or _cpus(), K)
+    workers = args.workers or min(_cpus(), batch * K)
+    run_key = _run_key(args, budget, checkpoints)
 
     print("\n=== tuning %s ===" % tag)
-    print("    hidden=%s n_per_dim=%d t_step=%.0f -> genome dim=%d (%.1fs compile)"
-          % (cell['hidden_sizes'], cell['n_per_dim'], T_STEP_FIXED, dim,
-             time.time() - t0))
+    print("    hidden=%s n_per_dim=%d t_step=%.0f -> genome dim=%d"
+          % (cell['hidden_sizes'], cell['n_per_dim'], T_STEP_FIXED, dim))
     print("    tuning: %s" % ", ".join(keys))
-    print("    outer=%s budget=%d | inner=%s budget=%d K=%d, %d episodes per evaluation"
-          % (args.outer_optimizer, args.outer_budget, args.inner_optimizer,
-             args.inner_budget, args.k_inner, INNER_EVAL_EPISODES))
+    print("    outer=%s budget=%d in batches of %d | inner=%s budget=%d (%.3g x d) K=%d, "
+          "%d episodes per evaluation | %d workers"
+          % (args.outer_optimizer, args.outer_budget, batch, args.inner_optimizer,
+             budget, budget / float(dim), K, args.eval_episodes, workers))
+    if checkpoints:
+        print("    checkpoints: recommendation also scored after %s evaluations"
+              % ", ".join("%d (%.3g x d)" % (c, c / float(dim)) for c in checkpoints))
 
     # ---- outer optimizer, resumed if asked and available -------------------
-    history, start_i, outer = [], 0, None
+    history, outer = [], None
     if args.resume and os.path.exists(ckpt_opt):
+        with open(ckpt_json) as f:
+            saved = json.load(f)
+        if saved.get('run') != run_key:
+            raise SystemExit(
+                "%s was made with different scoring settings:\n  saved: %s\n  now:   %s\n"
+                "Its scores can't be mixed with new ones. Rerun without --resume to "
+                "start over (that overwrites it), or use another --out-dir."
+                % (ckpt_json, saved.get('run'), run_key))
         try:
             outer = ng.optimizers.base.Optimizer.load(ckpt_opt)
-            with open(ckpt_json) as f:
-                history = json.load(f).get('history', [])
-            start_i = len(history)
+            history = saved.get('history', [])
             print("    [resume] %d/%d evaluations already done"
-                  % (start_i, args.outer_budget))
+                  % (len(history), args.outer_budget))
         except Exception as exc:
             print("    [resume] could not load %s (%s); starting fresh"
                   % (ckpt_opt, exc))
-            outer, history, start_i = None, [], 0
+            outer, history = None, []
     if outer is None:
-        if args.outer_optimizer == 'TBPSA':
-            outer = O.ParametrizedTBPSA(naive=True)(
-                parametrization=space, budget=int(args.outer_budget))
-        else:
-            outer = ng.optimizers.registry[args.outer_optimizer](
-                parametrization=space, budget=int(args.outer_budget))
+        outer = make_outer(space, args.outer_optimizer, args.outer_budget, batch)
 
-    # ---- ask / tell loop, so we can checkpoint between evaluations ---------
-    for i in range(start_i, int(args.outer_budget)):
-        cand = outer.ask()
-        cfg = resolve(dict(cand.kwargs), cell['encoding'])
+    t_build = time.time()
+    runner = Runner(cell, workers)
+    try:
+        # ---- batches: ask, score in parallel, tell, checkpoint ------------
+        while len(history) < int(args.outer_budget):
+            n = min(batch, int(args.outer_budget) - len(history))
+            cands = [outer.ask() for _ in range(n)]
+            cfgs = [resolve(dict(c.kwargs), cell['encoding']) for c in cands]
+            t0 = time.time()
+            scores = score_configs(runner, cfgs, SEED, args, budget, checkpoints)
+            secs = time.time() - t0
+            for cand, cfg, sc in zip(cands, cfgs, scores):
+                outer.tell(cand, -sc['mean'])        # minimize -> maximize fitness
+                i = len(history)
+                history.append(dict(i=i, config=cfg, batch_seconds=secs, **sc))
+                print("  [%3d/%d] %-36s -> %8.2f +/- %6.2f | raw %7.1f | goal %3.0f%% "
+                      "| random %4.1f%% %s"
+                      % (i + 1, args.outer_budget, _fmt(cfg, keys), sc['mean'], sc['std'],
+                         sc['raw'], 100 * sc['goal_share'], 100 * sc['random_actions'],
+                         _fmt_ck(sc, checkpoints, dim)))
+            print("          batch of %d configs x %d runs: %s" % (n, K, _fmt_secs(secs)),
+                  flush=True)
+            _atomic_write(ckpt_json, dict(cell=cell, active=keys, run=run_key,
+                                          history=history))
+            try:
+                outer.dump(ckpt_opt)
+            except Exception:
+                pass                                # resume degrades, run does not
 
-        t0 = time.time()
-        sc = score_config(net, cfg, SEED, args.k_inner,
-                          args.inner_optimizer, args.inner_budget)
-        outer.tell(cand, -sc['mean'])           # minimize -> maximize fitness
+        # ---- best config, then an honest held-out re-score -----------------
+        best_entry = max(history, key=lambda h: h['mean'])
+        best_cfg = best_entry['config']
+        search_score = best_entry['mean']
 
-        history.append(dict(i=i, config=cfg, seconds=time.time() - t0, **sc))
-        print("  [%3d/%d] %-36s -> %8.2f +/- %6.2f | raw %7.1f | random %4.1f%%  (%.0fs)"
-              % (i + 1, args.outer_budget, _fmt(cfg, keys), sc['mean'], sc['std'],
-                 sc['raw'], 100 * sc['random_actions'], time.time() - t0))
-
-        _atomic_write(ckpt_json, dict(cell=cell, active=keys, history=history))
-        try:
-            outer.dump(ckpt_opt)
-        except Exception:
-            pass                                # resume degrades, run does not
-
-    # ---- best config, then an honest held-out re-score ---------------------
-    best_entry = max(history, key=lambda h: h['mean'])
-    best_cfg = best_entry['config']
-    search_score = best_entry['mean']
-
-    holdout_base = SEED + HOLDOUT_OFFSET
-    hold = score_config(net, best_cfg, holdout_base, args.k_inner,
-                        args.inner_optimizer, args.inner_budget)
-
-    # paired baseline: the current settings, SAME held-out seeds, SAME network --
-    # so the gap is purely the tuned parameters
-    base_cfg = baseline_config()
-    base = score_config(net, base_cfg, holdout_base, args.k_inner,
-                        args.inner_optimizer, args.inner_budget)
+        # paired baseline: the current settings, SAME held-out seeds, SAME network --
+        # so the gap is purely the tuned parameters. Both in one batch.
+        base_cfg = baseline_config()
+        hold, base = score_configs(runner, [best_cfg, base_cfg], SEED + HOLDOUT_OFFSET,
+                                   args, budget, checkpoints)
+    finally:
+        runner.close(args.keep_builds)
 
     result = dict(
         cell=cell, active=keys, genome_dim=dim,
         best_config=best_cfg,
         search_score=search_score,
         holdout_score=hold['mean'], holdout_std=hold['std'], holdout_vals=hold['vals'],
-        holdout_raw=hold['raw'], holdout_random_actions=hold['random_actions'],
+        holdout_raw=hold['raw'], holdout_raw_vals=hold['raw_vals'],
+        holdout_goal_share=hold['goal_share'],
+        holdout_random_actions=hold['random_actions'],
+        holdout_checkpoints=hold['checkpoints'],
         baseline_config=base_cfg,
         baseline_score=base['mean'], baseline_std=base['std'], baseline_vals=base['vals'],
-        baseline_raw=base['raw'], baseline_random_actions=base['random_actions'],
+        baseline_raw=base['raw'], baseline_raw_vals=base['raw_vals'],
+        baseline_goal_share=base['goal_share'],
+        baseline_random_actions=base['random_actions'],
+        baseline_checkpoints=base['checkpoints'],
         improvement=hold['mean'] - base['mean'],
         overfit_gap=search_score - hold['mean'],
         settings=dict(t_step=T_STEP_FIXED,
                       outer_optimizer=args.outer_optimizer,
                       outer_budget=args.outer_budget,
+                      outer_batch=batch,
                       inner_optimizer=args.inner_optimizer,
-                      inner_budget=args.inner_budget,
-                      inner_eval_episodes=INNER_EVAL_EPISODES,
-                      k_inner=args.k_inner,
-                      tune_report_episodes=TUNE_REPORT_EPISODES,
-                      weight_search_cube=[-1.0, 1.0],
-                      inner_sigma=INNER_SIGMA,
+                      inner_budget=budget,
+                      inner_evals_per_dim=(None if args.inner_budget is not None
+                                           else args.evals_per_dim),
+                      checkpoints=checkpoints,
+                      inner_eval_episodes=int(args.eval_episodes),
+                      training_episodes='seeded, fresh at every evaluation',
+                      k_inner=K,
+                      tune_report_episodes=int(args.report_episodes),
+                      weight_box='optimize_snn: [-w_scale, w_scale]',
+                      param=hold['param'],
+                      trial_offset=TRIAL_OFFSET,
                       graded=GRADED,
                       generator=cell.get('generator') or snn.SPIKE_GENERATOR,
-                      seed=SEED),
+                      seed=SEED, workers=workers,
+                      wall_seconds=round(time.time() - t_build, 1)),
         history=history,
     )
-    _atomic_write(os.path.join(OUT_DIR, "result-%s.json" % tag), result)
+    _atomic_write(os.path.join(out_dir, "result-%s.json" % tag), result)
 
     print("\n  best config   : %s" % _fmt(best_cfg, keys))
     print("  weight bound  : +/-%.1f (W_LOW / W_HIGH in optimize_snn.py, --bound in calibrate.py)"
           % best_cfg['w_scale'])
     print("  search score  : %.3f" % search_score)
-    print("  holdout score : %.3f +/- %.3f | raw %.1f | random %.1f%%"
-          % (hold['mean'], hold['std'], hold['raw'], 100 * hold['random_actions']))
-    print("  baseline      : %.3f +/- %.3f | raw %.1f | random %.1f%%  (%s)"
-          % (base['mean'], base['std'], base['raw'], 100 * base['random_actions'],
-             _fmt(base_cfg, keys)))
+    print("  holdout score : %.3f +/- %.3f | raw %.1f | goal %.0f%% | random %.1f%%"
+          % (hold['mean'], hold['std'], hold['raw'], 100 * hold['goal_share'],
+             100 * hold['random_actions']))
+    print("  baseline      : %.3f +/- %.3f | raw %.1f | goal %.0f%% | random %.1f%%  (%s)"
+          % (base['mean'], base['std'], base['raw'], 100 * base['goal_share'],
+             100 * base['random_actions'], _fmt(base_cfg, keys)))
     print("  improvement   : %+.3f%s"
           % (hold['mean'] - base['mean'],
              "" if hold['mean'] > base['mean'] else "   (tuning did NOT help)"))
@@ -560,17 +769,125 @@ def tune(cell, args):
 
 
 # ============================================================================
+# BUDGET CHECK: DO THE LAST EVALUATIONS ADD ANYTHING?
+# ============================================================================
+
+def _paired_p(a, b):
+    """Two-sided paired t-test p of a vs b; None when it can't be computed."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    d = a - b
+    if len(d) < 2 or np.allclose(d, d[0]):
+        return None
+    try:
+        from scipy import stats
+        p = float(stats.ttest_rel(a, b).pvalue)
+    except Exception:
+        return None
+    return None if p != p else p
+
+
+def budget_check(cell, args):
+    """The current settings of one cell, K inner runs in parallel, scored at every
+    checkpoint and at the full budget on the same report episodes."""
+    tag = _cell_tag(cell)
+    dim = cell_dim(cell)
+    budget = inner_budget(dim, args)
+    checkpoints = checkpoint_counts(dim, budget, args.checkpoints)
+    K = int(args.k_inner)
+    workers = args.workers or min(_cpus(), K)
+    cfg = baseline_config()
+    keys = active_params(cell['encoding'])
+
+    print("\n=== budget check %s ===" % tag)
+    print("    genome dim=%d | %s, budget %d (%.3g x d), K=%d runs on %d workers | "
+          "current settings: %s"
+          % (dim, args.inner_optimizer, budget, budget / float(dim), K, workers,
+             _fmt(cfg, keys)))
+    t0 = time.time()
+    runner = Runner(cell, workers)
+    try:
+        sc = score_configs(runner, [cfg], SEED + BUDGET_CHECK_OFFSET, args, budget,
+                           checkpoints)[0]
+    finally:
+        runner.close(args.keep_builds)
+    secs = time.time() - t0
+
+    rows = [(c, sc['checkpoints'][str(c)]) for c in checkpoints] + [(budget, sc)]
+    final_raw = sc['raw_vals']
+    print("\n    %8s %8s %10s %9s %6s %7s   %s"
+          % ('evals', 'x d', 'shaped', 'raw', 'goal', 'random',
+             'final minus this row: raw, runs final better, paired p'))
+    table = []
+    for count, r in rows:
+        line = "    %8d %8.3g %10.2f %9.2f %5.0f%% %6.1f%%" % (
+            count, count / float(dim), r['mean'], r['raw'], 100 * r['goal_share'],
+            100 * r['random_actions'])
+        entry = dict(evaluations=count, per_weight=count / float(dim), shaped=r['mean'],
+                     raw=r['raw'], raw_vals=r['raw_vals'], goal_share=r['goal_share'],
+                     random_actions=r['random_actions'])
+        if count != budget:
+            diff = float(np.mean(np.asarray(final_raw) - np.asarray(r['raw_vals'])))
+            better = int(np.sum(np.asarray(final_raw) > np.asarray(r['raw_vals'])))
+            p = _paired_p(final_raw, r['raw_vals'])
+            line += "   %+8.2f  %d/%d  %s" % (diff, better, K,
+                                             '-' if p is None else '%.3f' % p)
+            entry.update(final_minus_this_raw=diff, runs_final_better=better, p=p)
+        table.append(entry)
+        print(line)
+    print("\n    %d runs in %s. Raw reward of the recommendation on %d report episodes "
+          "per run; the rows pair run by run." % (K, _fmt_secs(secs), args.report_episodes))
+    if K < 8:
+        print("    With K=%d the paired p is weak; --k-inner 8 or more costs no extra "
+              "time while there are free cores." % K)
+    out = dict(cell=cell, genome_dim=dim, config=cfg, inner_optimizer=args.inner_optimizer,
+               budget=budget, k_inner=K, eval_episodes=int(args.eval_episodes),
+               report_episodes=int(args.report_episodes), param=sc['param'],
+               seed_block=SEED + BUDGET_CHECK_OFFSET, seconds=round(secs, 1), rows=table)
+    os.makedirs(args.out_dir, exist_ok=True)
+    path = os.path.join(args.out_dir, "budget-%s-%s.json" % (tag, args.inner_optimizer))
+    _atomic_write(path, out)
+    print("    -> %s" % path)
+    return out
+
+
+# ============================================================================
 # COST ESTIMATE
 # ============================================================================
 
-def print_cost(args):
-    per_cfg = args.k_inner * (args.inner_budget * INNER_EVAL_EPISODES
-                              + TUNE_REPORT_EPISODES)
-    total = per_cfg * (args.outer_budget + 2)   # +2 for holdout and baseline
-    print("    episodes: %d per config x %d configs (+holdout+baseline) = %d"
-          % (per_cfg, args.outer_budget, total))
-    print("    at 0.10 s/ep -> ~%.1f h | at 0.50 s/ep -> ~%.1f h"
-          % (total * 0.10 / 3600.0, total * 0.50 / 3600.0))
+def print_cost(cell, args):
+    dim = cell_dim(cell)
+    budget = inner_budget(dim, args)
+    checkpoints = checkpoint_counts(dim, budget, args.checkpoints)
+    K = int(args.k_inner)
+    per_run = (budget * int(args.eval_episodes)
+               + (len(checkpoints) + 1) * int(args.report_episodes))
+    ep = EP_SECONDS.get(cell['environment'], 0.03)
+    run_s = per_run * ep
+    print("    genome dim %d -> inner budget %d (%.3g x d)%s"
+          % (dim, budget, budget / float(dim),
+             ("; checkpoints at " + ", ".join("%d" % c for c in checkpoints))
+             if checkpoints else ""))
+    print("    %d episodes per inner run, ~%s at %.3f s per episode"
+          % (per_run, _fmt_secs(run_s), ep))
+    if args.budget_check:
+        workers = args.workers or min(_cpus(), K)
+        waves = int(math.ceil(K / float(workers)))
+        print("    budget check: %d runs on %d workers -> ~%s"
+              % (K, workers, _fmt_secs(waves * run_s)))
+        return
+    batch = args.batch or default_batch(cell['encoding'], args.outer_optimizer,
+                                        args.workers or _cpus(), K)
+    workers = args.workers or min(_cpus(), batch * K)
+    sizes = [batch] * (int(args.outer_budget) // batch)
+    if int(args.outer_budget) % batch:
+        sizes.append(int(args.outer_budget) % batch)
+    sizes.append(2)                                   # holdout + baseline
+    waves = sum(int(math.ceil(s * K / float(workers))) for s in sizes)
+    n_runs = sum(sizes) * K
+    print("    %d inner runs: %d batches of up to %d configs x K=%d on %d workers -> "
+          "~%s (serial ~%s)"
+          % (n_runs, len(sizes), batch, K, workers, _fmt_secs(waves * run_s),
+             _fmt_secs(n_runs * run_s)))
 
 
 # ============================================================================
@@ -593,22 +910,39 @@ def main():
                     help='override the poprate spike generator of every cell')
     ap.add_argument('--outer-budget', type=int, default=OUTER_BUDGET)
     ap.add_argument('--outer-optimizer', default=OUTER_OPTIMIZER)
+    ap.add_argument('--batch', type=int, default=None,
+                    help='configs scored at once (default: see OUTER_BATCH)')
     ap.add_argument('--inner-optimizer', default=INNER_OPTIMIZER)
-    ap.add_argument('--inner-budget', type=int, default=INNER_BUDGET)
+    ap.add_argument('--evals-per-dim', type=float, default=INNER_EVALS_PER_DIM,
+                    help='inner budget = this x d (default %g)' % INNER_EVALS_PER_DIM)
+    ap.add_argument('--inner-budget', type=int, default=None,
+                    help='fixed inner budget for every cell instead of --evals-per-dim')
+    ap.add_argument('--checkpoints', type=float, nargs='*',
+                    default=list(CHECKPOINTS_PER_DIM),
+                    help='also score the recommendation after these x d evaluations')
     ap.add_argument('--k-inner', type=int, default=K_INNER)
     ap.add_argument('--eval-episodes', type=int, default=INNER_EVAL_EPISODES,
                     help='episodes per inner evaluation (see INNER_EVAL_EPISODES)')
+    ap.add_argument('--report-episodes', type=int, default=TUNE_REPORT_EPISODES)
+    ap.add_argument('--workers', type=int, default=None,
+                    help='worker processes (default: one per inner run of a batch, '
+                         'at most the number of cores; 1 = serial)')
+    ap.add_argument('--budget-check', action='store_true',
+                    help='score the current settings at every checkpoint and stop')
+    ap.add_argument('--keep-builds', action='store_true',
+                    help="keep the workers' ANNarchy builds")
+    ap.add_argument('--out-dir', default=OUT_DIR,
+                    help='checkpoints and results (default %s)' % OUT_DIR)
     ap.add_argument('--resume', action='store_true')
     ap.add_argument('--dry-run', action='store_true',
-                    help='print space and cost estimate, run nothing')
+                    help='print budgets, batches and cost estimate, run nothing')
     ap.add_argument('--quick', action='store_true',
                     help='tiny budgets to check the plumbing end to end')
     args = ap.parse_args()
 
-    globals()['INNER_EVAL_EPISODES'] = int(args.eval_episodes)
     if args.quick:
         args.outer_budget, args.inner_budget, args.k_inner = 4, 20, 1
-        globals()['TUNE_REPORT_EPISODES'] = 3
+        args.report_episodes, args.checkpoints = 3, [0.1]
 
     cells = [dict(c) for c in CELLS
              if args.env == 'all' or c['environment'] == args.env]
@@ -636,10 +970,15 @@ def main():
         print("cell: %s  hidden=%s n_per_dim=%d t_step=%.0f"
               % (_cell_tag(c), c['hidden_sizes'], c['n_per_dim'], T_STEP_FIXED))
         print("    tuning: %s" % ", ".join(active_params(c['encoding'])))
-        print_cost(args)
+        print_cost(c, args)
 
     if args.dry_run:
         print("\n[dry-run] nothing executed. Drop --dry-run to start.")
+        return
+
+    if args.budget_check:
+        for c in cells:
+            budget_check(c, args)
         return
 
     results = {}
@@ -654,7 +993,7 @@ def main():
                        improvement=r['improvement'],
                        overfit_gap=r['overfit_gap'])
                for k, r in results.items()}
-    _atomic_write(os.path.join(OUT_DIR, 'summary.json'), summary)
+    _atomic_write(os.path.join(args.out_dir, 'summary.json'), summary)
     print("\n=== summary ===")
     print(json.dumps(summary, indent=2))
 
