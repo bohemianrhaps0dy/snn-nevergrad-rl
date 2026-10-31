@@ -24,21 +24,8 @@ How each optimizer's final network is chosen and scored (test plan items in brac
        point; the loop makes exactly the same calls, and reading the recommendation
        doesn't change what the optimizer does next.
 
-One inner run, shared with tune_hyperparams.py:
-  make_objective()  the training objective: minus the mean fitness over EVAL_EPISODES
-                    training episodes
-  initial_point()   the trial's starting weights, uniform in [W_LOW, W_HIGH]
-  train_weights()   make_parametrization() plus the ask/tell loop above, returning the
-                    recommendation (and the recommendation at any checkpoints)
-optimize() runs every optimizer through these, and tune_hyperparams.py runs its inner
-optimizations through the same three, so a tuned setting is scored on exactly the search
-the grid runs: same box, same sigma, same noise flag, same recommendation rule.
-
 Episodes:
-  training    unseeded random starts (unchanged). make_objective(train_seed=t), used by
-              tune_hyperparams.py only, gives episode j of evaluation i the start
-              TRAIN_SEED_BASE + t * 10**9 + i * n + j (n episodes per evaluation): fresh
-              at every evaluation, but the same sequence for everything run with seed t
+  training    unseeded random starts (unchanged)
   selection   seeds (SELECT_SEED + trial) * 1000 + k   (N1_TOP > 0 only)
   report      seeds (REPORT_SEED + trial) * 1000 + k
 Within a trial every candidate and every optimizer is scored on the same starts and the
@@ -74,29 +61,8 @@ N3_PER_WEIGHT = 20     # also score the recommendation after 20 x d evaluations
 REPORT_SEED   = 7000   # report block seeds    (REPORT_SEED + trial) * 1000 + k
 SELECT_SEED   = 8000   # selection block seeds (SELECT_SEED + trial) * 1000 + k
 CHECK_SEED    = 9_000_000          # episodes used by check_scoring_loop()
-TRAIN_SEED_BASE = 10 ** 12         # seeded training episodes (make_objective(train_seed=...),
-                                   # tune_hyperparams.py only): far above every block above
 START_CHECK_X = (-0.58, -0.42)     # P2 start positions, MountainCar at rest
 MC_ACTIONS    = ('left', 'none', 'right')
-
-# ---------- parametrization: what every optimizer is given ----------
-# Nevergrad doesn't measure noise and doesn't know what a weight unit is: both come from
-# the parametrization, and both change what several optimizers do (checked in Nevergrad
-# 1.0.12 with identical losses):
-#   PARAM_NOISY  True declares the objective noisy (param.function.deterministic = False)
-#                for every optimizer. 'CMA' then runs OldCMA instead of the elitist
-#                CMAbounded, 'NGOpt' switches to the chain NoisyRL3 runs, and OnePlusOne
-#                and PSO recommend by Nevergrad's pessimistic estimate instead of the best
-#                single score. TBPSA, DE, TwoPointsDE, RandomSearch and NoisyRL3 ignore it.
-#   PARAM_SIGMA  the mutation step, in weight units. None keeps Nevergrad's default of
-#                1.0; 'range/6' uses (W_HIGH - W_LOW) / 6, the step Nevergrad sets itself
-#                when an Array gets its bounds in the constructor; a number sets it
-#                directly. The steps of CMA, NGOpt, TBPSA, OnePlusOne and NoisyRL3, and
-#                PSO's starting speeds, scale with it. DE, TwoPointsDE and RandomSearch
-#                sample the whole box and step by differences, so they don't.
-# The defaults reproduce the runs made before these settings existed.
-PARAM_NOISY = True
-PARAM_SIGMA = 'range/6'
 
 
 # ---------- flatten / unflatten ----------
@@ -383,139 +349,6 @@ def _candidates(rec_flat, tracker):
     return cands
 
 
-# ---------- parametrization ----------
-def param_sigma():
-    """PARAM_SIGMA in weight units, or None for Nevergrad's default (1.0)."""
-    if PARAM_SIGMA is None:
-        return None
-    if PARAM_SIGMA == 'range/6':
-        return (W_HIGH - W_LOW) / 6.0
-    return float(PARAM_SIGMA)
-
-
-def make_parametrization(name, init, trial):
-    """The search space optimizer `name` is given: the box [W_LOW, W_HIGH] starting at
-    init, with PARAM_SIGMA's step and PARAM_NOISY's declaration. Returns (param, info),
-    info being what the results record.
-
-    With the defaults this is exactly what optimize() built before. The bounds stay in
-    set_bounds(): ng.p.Array(init=..., lower=..., upper=...) would give the same sigma
-    as 'range/6' but switch off the box-wide sampling DE, PSO and RandomSearch start
-    from when an init is given.
-    """
-    sigma = param_sigma()
-    param = ng.p.Array(init=init.copy())
-    if sigma is not None:
-        param.set_mutation(sigma=sigma)   # before set_bounds, which checks 3 sigma fit
-    param.set_bounds(W_LOW, W_HIGH)
-    noisy = bool(PARAM_NOISY)
-    param.function.deterministic = False
-    param.real_world = True
-    param.neural = True    
-    param.random_state = np.random.RandomState(SEED + int(trial))
-    info = dict(noisy=noisy, sigma=float(np.ravel(param.sigma.value)[0]),
-                sigma_rule=('nevergrad default' if PARAM_SIGMA is None
-                            else str(PARAM_SIGMA)))
-    return param, info
-
-
-def sub_optim(optimizer):
-    """What a selector such as CMA, NGOpt or NgIohTuned actually ran; None for the
-    others. Read after the run, so asking changes nothing."""
-    try:
-        return optimizer._info().get('sub-optim')
-    except Exception:
-        return None
-
-
-# ---------- the inner run, shared with tune_hyperparams.py ----------
-def training_seed(train_seed, evaluation, j, n_episodes):
-    """Episode seed of training episode j of evaluation `evaluation` (both from 0) in a
-    run seeded with train_seed. See make_objective()."""
-    offset = int(evaluation) * int(n_episodes) + int(j)
-    if offset >= 10 ** 9:
-        raise ValueError("more than 10**9 seeded training episodes in one run")
-    return TRAIN_SEED_BASE + int(train_seed) * 10 ** 9 + offset
-
-
-def make_objective(net, shapes, n_episodes=None, train_seed=None):
-    """The objective every optimizer minimizes: minus the mean fitness of a weight
-    vector over n_episodes training episodes (EVAL_EPISODES when None).
-
-    train_seed None: unseeded random starts at every evaluation, the grid's regime.
-    train_seed int:  evaluation i (counted by this objective, from 0) runs the episodes
-                     training_seed(train_seed, i, j, n_episodes) for j < n_episodes.
-                     The starts are fresh at every evaluation, as in the grid, but
-                     anything run with the same train_seed sees the same starts at the
-                     same evaluation, so two tuning configs are compared on the same
-                     draws. TRAIN_SEED_BASE keeps them clear of every scored block.
-    The decoder's random draws come from numpy's global generator in both cases.
-    """
-    n = EVAL_EPISODES if n_episodes is None else int(n_episodes)
-    if n < 1:
-        raise ValueError("n_episodes must be more than 0")
-    calls = [0]
-
-    def objective(flat):
-        weights = flat_to_weights(flat, shapes)
-        fitness = 0
-        for j in range(n):
-            if train_seed is None:
-                fitness = fitness + -float(evaluate(net, weights))
-            else:
-                seed = training_seed(train_seed, calls[0], j, n)
-                fitness = fitness + -float(evaluate(net, weights, episode_seed=seed))
-        calls[0] += 1
-        return fitness / n
-
-    return objective
-
-
-def initial_point(dim, trial):
-    """The starting weights every optimizer of trial `trial` gets: one uniform draw in
-    [W_LOW, W_HIGH] from default_rng(SEED + trial)."""
-    rng = np.random.default_rng(SEED + int(trial))
-    return rng.uniform(W_LOW, W_HIGH, size=int(dim))
-
-
-def train_weights(name, init, trial, budget, objective, checkpoints=(), top=0):
-    """Run optimizer `name` on the weights: make_parametrization(name, init, trial), then
-    Nevergrad's ask/tell loop for its budget -- what optimizer.minimize(objective) does,
-    written out so the recommendation can be read after the evaluation counts in
-    `checkpoints` (reading it doesn't change what the optimizer does next).
-
-    Returns a dict:
-      rec          the final recommendation (flat vector)
-      rec_train    (mean training fitness, evaluations) of rec; (None, 0) if never evaluated
-      checkpoints  {count: (recommendation after `count` evaluations, its rec_train)},
-                   for every count the budget reaches
-      tracker      the _Tracker (keeps the `top` best vectors for the N1 diagnostic)
-      param        make_parametrization()'s info: sigma, noise declared or not
-      sub_optim    what a selector (CMA, NGOpt, ...) ran
-      evaluations  objective calls made
-    """
-    param, param_info = make_parametrization(name, init, trial)
-    opt_cls = ng.optimizers.registry[name]
-    optimizer = opt_cls(parametrization=param, budget=budget)
-
-    tracker = _Tracker(objective, top)
-    wanted = set(int(c) for c in checkpoints)
-    snaps = {}
-    for i in range(optimizer.budget):
-        cand = optimizer.ask()
-        optimizer.tell(cand, tracker(*cand.args, **cand.kwargs))
-        if i + 1 in wanted:
-            x = np.array(optimizer.provide_recommendation().value, dtype=float,
-                         copy=True)
-            snaps[i + 1] = (x, tracker.train(x))
-    rec_flat = np.array(optimizer.provide_recommendation().value, dtype=float,
-                        copy=True)
-    rec_train = tracker.train(rec_flat)
-    ran = sub_optim(optimizer)
-    return dict(rec=rec_flat, rec_train=rec_train, checkpoints=snaps, tracker=tracker,
-                param=param_info, sub_optim=ran, evaluations=tracker.n)
-
-
 # ---------- run multiple optimizers ----------
 def optimize(environment, hidden_sizes, encoding, decoding,
              optimizers=OPTIMIZERS, budget=BUDGET, trial=0, n_per_dim=None):
@@ -536,9 +369,6 @@ def optimize(environment, hidden_sizes, encoding, decoding,
       pick, selection, rec_fitness, rec_raw,     [N1] diagnostic; with N1_TOP = 0, pick is
       rec_goal_share, rec_random_actions         'rec', selection is empty and rec_* repeat
                                                  the values above
-      param                                      the parametrization: sigma in weight
-                                                 units, noise declared or not
-      sub_optim                                  what a selector (CMA, NGOpt, ...) ran
       evaluations, weights
     """
     if EVAL_EPISODES < 1:
@@ -556,11 +386,21 @@ def optimize(environment, hidden_sizes, encoding, decoding,
     dim = n_params(shapes)
     check_scoring_loop(net, shapes)    # the report must score what evaluate() scores
 
-    # EVAL_EPISODES unseeded training episodes per evaluation (only proj.w updates)
-    objective = make_objective(net, shapes)
+    def objective(flat):
+        # only proj.w updates
+        #this 10
+        fitness = 0
+        i = 0
+        while i < EVAL_EPISODES:
+            # testing multiple monitors for net activity
+            # -float(evaluate(net, flat_to_weights(flat, shapes)))
+            fitness = fitness + -float(evaluate(net, flat_to_weights(flat, shapes)))
+            i = i + 1
+        return fitness / EVAL_EPISODES
 
     # one random start per trial, shared by every optimizer of that trial
-    init = initial_point(dim, trial)
+    rng = np.random.default_rng(SEED + int(trial))
+    init = rng.uniform(W_LOW, W_HIGH, size=dim)
 
     n3_at = int(round(N3_PER_WEIGHT * dim))
     select_seed = SELECT_SEED + int(trial)
@@ -568,13 +408,34 @@ def optimize(environment, hidden_sizes, encoding, decoding,
 
     results = {}
     for name in optimizers:
-        # the shared inner run (also tune_hyperparams.py's): make_parametrization() and
-        # the ask/tell loop, with the recommendation read after n3_at evaluations [N3]
-        run = train_weights(name, init, trial, budget, objective,
-                            checkpoints=(n3_at,), top=N1_TOP)
-        rec_flat, rec_train, tracker = run['rec'], run['rec_train'], run['tracker']
-        n3_flat, n3_train = run['checkpoints'].get(n3_at, (None, (None, 0)))
-        param_info, ran = run['param'], run['sub_optim']
+        if name == 'NgIohTuned':
+            param = (ng.p.Array(init=init.copy())
+                   .set_bounds(W_LOW, W_HIGH))
+            param.real_world = True
+            param.neural = True
+            param.function.deterministic = False
+            #NoisyRL2
+        else:
+            param = (ng.p.Array(init=init.copy())
+                   .set_bounds(W_LOW, W_HIGH))
+        param.random_state = np.random.RandomState(SEED + int(trial))
+        opt_cls = ng.optimizers.registry[name]
+        optimizer = opt_cls(parametrization=param, budget=budget)
+
+        # what optimizer.minimize(objective) does, written out so the recommendation
+        # can be read after n3_at evaluations [N3]
+        tracker = _Tracker(objective, N1_TOP)
+        n3_flat, n3_train = None, (None, 0)
+        for i in range(optimizer.budget):
+            cand = optimizer.ask()
+            optimizer.tell(cand, tracker(*cand.args, **cand.kwargs))
+            if i + 1 == n3_at:
+                n3_flat = np.array(optimizer.provide_recommendation().value,
+                                   dtype=float, copy=True)
+                n3_train = tracker.train(n3_flat)
+        rec_flat = np.array(optimizer.provide_recommendation().value, dtype=float,
+                            copy=True)
+        rec_train = tracker.train(rec_flat)
 
         opt_loss = objective(rec_flat)
 
@@ -631,8 +492,7 @@ def optimize(environment, hidden_sizes, encoding, decoding,
                              rec_goal_share=rec['goal_share'],
                              rec_random_actions=rec['random_actions'],
                              n3=n3, evaluations=tracker.n,
-                             opt_loss=opt_loss, param=param_info, sub_optim=ran,
-                             weights=best_weights)
+                             opt_loss=opt_loss, weights=best_weights)
 
         print("%-12s budget=%d  mean=%.3f  std=%.3f  sem=%.3f  raw=%.2f  "
               "(n=%d, opt=%.3f)"
@@ -658,9 +518,6 @@ def optimize(environment, hidden_sizes, encoding, decoding,
                      % (N3_PER_WEIGHT, dim, n3_at)]
         if start is not None:
             extra.append("start: " + ", ".join("%s %s" % kv for kv in start.items()))
-        extra.append("sigma %.3g%s%s" % (param_info['sigma'],
-                                          ", declared noisy" if param_info['noisy'] else "",
-                                          ", ran %s" % ran if ran else ""))
         print("%-12s %s" % ('', "  |  ".join(extra)), flush=True)
 
     return results
