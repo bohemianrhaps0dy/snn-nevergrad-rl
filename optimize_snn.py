@@ -95,8 +95,8 @@ MC_ACTIONS    = ('left', 'none', 'right')
 #                PSO's starting speeds, scale with it. DE, TwoPointsDE and RandomSearch
 #                sample the whole box and step by differences, so they don't.
 # The defaults reproduce the runs made before these settings existed.
-PARAM_NOISY = False
-PARAM_SIGMA = None
+PARAM_NOISY = True
+PARAM_SIGMA = 'range/6'
 
 
 # ---------- flatten / unflatten ----------
@@ -409,10 +409,8 @@ def make_parametrization(name, init, trial):
         param.set_mutation(sigma=sigma)   # before set_bounds, which checks 3 sigma fit
     param.set_bounds(W_LOW, W_HIGH)
     noisy = bool(PARAM_NOISY)
-    if name == 'NgIohTuned':              # its NoisyRL2 branch needs all three flags
-        param.real_world = True
-        param.neural = True
-        noisy = True
+    param.real_world = True
+    param.neural = True
     if noisy:
         param.function.deterministic = False
     param.random_state = np.random.RandomState(SEED + int(trial))
