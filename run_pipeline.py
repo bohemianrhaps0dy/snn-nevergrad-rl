@@ -56,8 +56,8 @@ GRID = dict(
     environments=['mountaincar', 'acrobot'],
     encodings=['poprate', 'poplatency'],
     decoding='first',                     # every cell, both encodings
-    topologies=[[6], [12], [6, 6], [10, 4]],
-    n_per_dim=[2, 4, 6, 10],
+    topologies=[[12], [6, 6], [10, 4]],
+    n_per_dim=[4],
     trials=5,
     generator='regular',                  # poprate's spike generator, in tuning and grid
     evals_per_dim=40,                    # grid budget = evals_per_dim x d, clipped to
